@@ -679,13 +679,8 @@ def keystats(wot, key, mod=None, wanted=0, restrict=None, timer=None):
             want += u"No wanted signatures found.\n"
         
     footer = u"Other report for this key are available:\n" \
-             u"  http://keyserver.kjsl.com/~jharris/ka/current/%s/%s\n" \
-             u"  http://thomas.butter.dk/gpg/getmsd.php?key=%s\n" \
              u"  http://pgp.cs.uu.nl/stats/%s.html\n" %\
-             (key2str(wot.keys[key]).upper()[:2],\
-              key2str(wot.keys[key]).upper()    ,\
-              key2str(wot.keys[key]).upper()    ,\
-              key2str(wot.keys[key]).upper())
+             (key2str(wot.keys[key]).upper())
     sup = wot.sigs[UP][key]
     sdn = wot.sigs[DN][key]
     sigs_up = [(x, "-,%s" % clascii[sup[x]])                  for x in sup if x not in sdn]
@@ -1580,7 +1575,7 @@ def wotsapmain(argv):
         print unicode(err).encode(encoding, 'replace')
         print "You need a .wot file which contains the list of keys and signatures."
         print "You can download the latest .wot file from"
-        print "  http://www.lysator.liu.se/~jc/wotsap/wots2/latest.wot"
+        print "  https://wot.siccegge.de/latest.wot"
         print "and either name it ~/.wotsapdb or give the filename as the -w argument."
         sys.exit(1)
 

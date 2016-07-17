@@ -13,6 +13,7 @@
                        default system TTF fonts.
                      - Small bugfix patch by Claudius Hubig
 	               <debian_1303@chubig.net>.
+                     - Remove references to services that are now dead.
 
 2013-02-16  Jörgen Cederlöf  <jc@lysator.liu.se>
 	Release 0.7
