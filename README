@@ -9,17 +9,17 @@ README:
 
   This file.
 
-wotsap.py:
+wotsap:
 
-  The main Wotsap Python module. It also works as a standalone
-  program.
+  The main Wotsap Python program. It also works as a module if you
+  rename it to wotsap.py .
 
 Webware-Main.py:
 
   Glue between wotsap.py and Webware
   (http://webware.sourceforge.net/).
 
-pks2wot.py:
+pks2wot:
 
   A program to create .wot files using the pksclient program. You need
   a local pks keyserver to use it. It should be fairly easy to adopt

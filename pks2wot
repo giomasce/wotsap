@@ -97,6 +97,317 @@ def isvalidkeyid(keyid):
             return 0
     return 1
 
+def splitcolons(string):
+    """Split output from gpg --with-colons.
+    Reverse the quoting from gpg/util/miscutil.c/print_string()"""
+    # Benchmarking this might seem pointless, but emphasizes one
+    # important point: Small string manipulating functions, even
+    # though they do lots of splitting and replacing, doesn't take
+    # any time worth mentioning and would therefore be pointless
+    # to optimize. I like being reminded of this every time I see
+    # the benchmark.
+    benchmark("start", "splitcolons")
+    # Reverse this:
+    #for( ; n; n--, p++ )
+    #  if( *p < 0x20 || (*p >= 0x7f && *p < 0xa0) || *p == delim ||
+    #       (delim && *p=='\\')) {
+    #    putc('\\', fp);
+    #    if     ( *p == '\n' )  putc('n', fp);
+    #    else if( *p == '\r' )  putc('r', fp);
+    #    else if( *p == '\f' )  putc('f', fp);
+    #    else if( *p == '\v' )  putc('v', fp);
+    #    else if( *p == '\b' )  putc('b', fp);
+    #    else if( !*p )         putc('0', fp);
+    #    else fprintf(fp, "x%02x", *p );
+    #  } else putc(*p, fp);
+    # Also see file DETAILS from GnuPG distribution
+    fields = []
+    for x in string.split(":"):
+        tmp = x .replace("\\n", "\n")  \
+                .replace("\\r", "\r")  \
+                .replace("\\f", "\f")  \
+                .replace("\\v", "\v")  \
+                .replace("\\b", "\b")  \
+                .replace("\\0", "\x00")\
+                .split("\\")
+        s = tmp[0]
+        for y in tmp[1:]:
+            assert y[0] == "x"
+            assert len(y) >= 3
+            s += struct.pack('B', int(y[1:3],16)) + y[3:]
+        fields.append(s)
+    benchmark("stop", "splitcolons")
+    return fields
+
+def call_pksclient_real(db, keyid, keyfile, pksclient, append=0,
+                        nopkslogging=0, verbose=0, eightdigits=0):
+    v, a, pksflags = "2>/dev/null", ">", ""
+    if verbose:      v = ""
+    if append:       a = ">>"
+    if nopkslogging: pksflags = "t"
+    if eightdigits:
+        keyid = "0x" + keyid[-8:]
+    
+    benchmark("start", "pksclient")
+    benchmark("start", "pksclient: Key ")
+    # Problem: if pksclient is stopped, it will often leave stale
+    # lock files behind. We want to be able to stop the execution
+    # with C-c, but that will stop pksclient. Therefore, we make
+    # sure that pksclient has no controlling terminal.
+    if not os.fork():
+        # We are a child, but we still have a controlling
+        # terminal. Call setsid() to become group/session leader
+        # and get rid of the controlling tty.
+        os.setsid()
+        cmd = "%s %s get %s b%s %s%s %s" % \
+              (pksclient, db, keyid, pksflags, a, keyfile, v)
+        if verbose:
+            print cmd
+        ret = os.system(cmd)
+        if ret>=256: ret //= 256
+        os._exit(ret) # _exit() won't call cleanup handlers.
+    try:
+        ret = os.wait()[1]
+    except KeyboardInterrupt:
+        print "Keyboard interrupt. Waiting for pksclient to finish."
+        os.wait()
+        print "OK, pksclient has finished. Exiting."
+        sys.exit(1)
+    if ret>=256: ret //= 256
+    benchmark("stop", "pksclient: Key ", "%sfound." % (ret and "not " or ""))
+    benchmark("stop", "pksclient")
+    return not ret
+
+def call_pksclient(db, keyid, keyfile, pksclient, cachesize, append=0,
+                   nopkslogging=0, verbose=0, eightdigits=0):
+    """A caching wrapper around the real call_pksclient()."""
+    benchmark("start", "pksclientcache. Append: %s" % str(append))
+    cache = __keycache[0]
+    if keyid in cache:
+        if not cache[keyid]:
+            benchmark("tick", "pksclientcache: Using cached non-existing key")
+            ret = 0
+        else:
+            benchmark("start", "pksclientcache: Using cached key")
+            if append: mode = 'a'
+            else:      mode = 'w'
+            open(keyfile, mode).write(cache[keyid])
+            ret = 1
+            benchmark("stop",  "pksclientcache: Using cached key")
+    else:
+        benchmark("start", "pksclientcache: Calling pksclient")
+        if append: # Open and seek to end of file
+            f = open(keyfile, 'r')
+            f.seek(0, 2) 
+        if not call_pksclient_real(db, keyid, keyfile, pksclient, append,
+                                   nopkslogging, verbose, eightdigits):
+            # We cache information about key being unavailable
+            # forever - no need to remove it from the cache later,
+            # it is only a few bytes.
+            benchmark("tick", "pksclientcache: Caching non-existant key")
+            cache[keyid] = None
+            ret = 0
+        else:
+            benchmark("start", "pksclientcache: Caching key")
+            if append: # Read only new key
+                cache[keyid] = f.read()
+            else:
+                cache[keyid] = open(keyfile, 'r').read()
+            __keycache[1].append(keyid)
+            __keycache[2] += len(cache[keyid])
+            while __keycache[2] > cachesize:
+                # XXX What is the best strategy here? Let's just use
+                # FIFO until we know what is best.
+                # OK, this would probably be faster with a linked
+                # list, but the list only contains keyids so it is
+                # quite fast to copy.
+                remove = __keycache[1].pop(0)
+                __keycache[2] -= len(cache[remove])
+                del cache[remove]
+                benchmark("tick", "pksclientcache: Expiring key from cache")
+            ret = 1
+            benchmark("stop",  "pksclientcache: Caching key")
+        benchmark("stop",  "pksclientcache: Calling pksclient")
+    benchmark("stop", "pksclientcache. Append: %s" % str(append))
+    return ret
+
+
+def get_name_using_gpg(keyfile, tmpdir, gnupg='/usr/bin/gpg', verbose=0):
+    """Use GPG to extract name and KeyID"""
+    if verbose: v = ""
+    else:       v = "2>/dev/null"
+    benchmark("start", "gpg: get name")
+    cmd = "%s --with-colons " \
+          "--list-keys " \
+          "--homedir %s " \
+          "--keyring %s " \
+          "--no-default-keyring " \
+          "--no-auto-check-trustdb " \
+          "--no-expensive-trust-checks %s" \
+          % (gnupg, tmpdir, keyfile, v)
+    reply = os.popen(cmd)
+    name=keyid=None
+    for x in reply.xreadlines():
+        y = splitcolons(x)
+        if y[0] == "pub":
+            name = y[9].strip()
+            # Make sure we always use GPGs idea of keyid.
+            keyid = "0x" + y[4]
+            if y[1] != "":
+                benchmark("stop",  "gpg: get name")
+                if verbose:
+                    print "Bailing out on line %r." % y
+                return None, None
+            break
+    benchmark("stop",  "gpg: get name")
+    if not isvalidkeyid(keyid):
+        print >>sys.stderr, "Something seems to be wrong in the output when running:"
+        print >>sys.stderr, cmd
+        os._exit(7) # No cleanup will make debugging easier.
+    return keyid, name
+
+
+def get_signatures_using_gpg_real(keyid, keyfile, tmpdir, gnupg, verify,
+                                  verbose=0):
+    if verbose: v = ""
+    else:       v = "2>/dev/null"
+    if verify:  action = "--check-sigs"
+    else:       action = "--list-sigs"
+    benchmark("start", "gpg: get sigs. Verify: %s" % str(verify))
+    reply = os.popen("%s --with-colons "
+                     "%s "
+                     "--homedir %s "
+                     "--keyring %s "
+                     "--no-default-keyring "
+                     "--no-auto-check-trustdb "
+                     "--no-expensive-trust-checks "
+                     "--fixed-list-mode %s %s"
+                     % (gnupg, action, tmpdir, keyfile, keyid, v))
+    # OK, parse the GPG output.
+    uidsigs   = {} # Number of times this signature appears (decreased if rev)
+    uidsiglvl = {} # Maximum cert check level for this signature
+    sigs      = {} # The real signatures we return
+    # I can't find this explicitly in the GnuPG documentation, but
+    # reading between the lines, it is quite clear that the first
+    # user ID is the primary one.
+    primary_uid = 2
+    for x in reply.readlines() + ["sub"]:
+        y = splitcolons(x)
+        if   y[0] == "uid" or y[0] == "sub":          # Start/end of user ID
+            if keyid in uidsigs and uidsigs[keyid]>0:  # If self-signed
+                del uidsigs[keyid]                      # Remove self-signature
+                for z in uidsigs:
+                    if uidsigs[z] > 0:                  # For non-revoked sigs
+                        if z not in sigs or sigs[z] < uidsiglvl[z]:
+                            sigs[z] = uidsiglvl[z]      # Update sigs with new or higher levels
+            uidsigs, uidsiglvl = {}, {}
+            if primary_uid: primary_uid -= 1
+        elif y[0] == "sig":    # Signature
+            if verify and y[1] != "!":   # Invalid signature
+                #if y[1] != "?":
+                #    print "0x" + keyid + ": " + x[:-1]
+                continue
+            # The gpg --with-colons --fixed-list-mode format
+            # doesn't contain information about whether a
+            # signature has expired, but the expire time is there
+            # so we can check it ourselves.
+            if y[6] and int(y[6]) < time.time():
+                continue
+            key = "0x" + y[4]
+            lvl = int(y[10][1], 16)
+            if lvl > 3:    # Ignore direct-key signatures.
+                continue
+            if primary_uid: lvl += 4 # Add 4 if primary UID is signed.
+            if key not in uidsigs: uidsigs[key]  = 1
+            else:                  uidsigs[key] += 1
+            if key not in uidsiglvl or uidsiglvl[key] < lvl:
+                uidsiglvl[key] = lvl # Update uidsiglvl with new or higher levels
+        elif y[0] == "rev": # Revoked signature
+            key  = "0x" + y[4]
+            if key not in uidsigs: uidsigs[key]  = -1
+            else:                  uidsigs[key] -=  1
+        if y[0] == "sub":  # Stop processing when we get to subkeys.
+            break
+    benchmark("stop", "gpg: get sigs. Verify: %s" % str(verify))
+    if verbose:
+        print "Got %s signatures with gpg:" % (
+            verify and 'verified' or 'unverified'), sigs
+    return sigs
+
+def get_signatures_using_gpg(keyid, keyfile, tmpdir, gnupg, verify, sigcache,
+                             newsigcache, verbose=0):
+    """A caching wrapper around the real get_signatures_using_gpg()."""
+    # There are three cases where a signature can become invalid:
+    # 1. The signed key becomes invalid (revoked, expired)
+    # 2. The signature itself becomes invalid (revoked, expired)
+    # 3. The signing key becomes invalid (revoked, expired)
+    # This means that we never have to validate the signatures
+    # using both keys _at the same time_ to detect that a
+    # signature has become invalid. If we always run every key on
+    # it's own through gnupg, we detect cases 1 and 2 when running
+    # the signed key and 3 when running the signing key. We need
+    # only re-verify signatures using gpg when the signed key has
+    # changed. If signed key is unchanged, we can use the last
+    # signature list as candidates and count on invalid keys being
+    # removed later.
+
+    # Similarily, there are three cases where a signature becomes valid:
+    # 1. The signed key becomes valid (e.g. added self-signature)
+    # 2. The signature gets added
+    # 3. The signing key becomes valid (new self-signature or just uploaded)
+    # 1 and 2 both modifies the signed key. Unfortunately, 3 does
+    # not. It should be possible to verify only those signatures
+    # where the signing key has changed, but that is complicated. 
+    # Instead we verify all signatures on a key iff the signed key
+    # or any of the signing keys are modified. Some signatures
+    # will be re-verified without being strictly needed, but
+    # changes are probably rare enough to not impact speed
+    # noticably anyway.
+
+    # Conclusion: If not verifying signatures, don't use cache. If
+    # verifying signatures, calculate SHA1-sum of the whole
+    # keyring. If unchanged, use cached list of signatures.
+
+    # This approach should produce identical results as using no
+    # cache if this is true:
+    # If (gpg --check-sigs have previously verified a signature) and
+    #    (no key, just the time, has changed since verification) then:
+    #  (
+    #    if (gpg --list-keys sees nothing wrong with the signed key) and
+    #       (gpg --list-sigs sees nothing wrong with the signed key
+    #                                             or the signature) and
+    #       (gpg --list-keys sees nothing wrong with the signing key)
+    #     then and only then:
+    #         (gpg --check-sigs will verify the signature)
+    #  )
+    # If this should be false, I'd like to know about it.
+
+    if not verify:
+        return get_signatures_using_gpg_real(keyid, keyfile, tmpdir, gnupg,
+                                             verify, verbose)
+    if sigcache or newsigcache is not None:
+        benchmark("start", "gpgcache: Calculating SHA1-sum for keyring")
+        import sha
+        ringhash = sha.sha(open(keyfile).read()).digest()
+        benchmark("stop",  "gpgcache: Calculating SHA1-sum for keyring")
+    else:
+        ringhash = None
+    if ringhash in sigcache:
+        benchmark("tick",  "gpgcache: Using cached signatures")
+        sigs  = sigcache[ringhash]
+    else:
+        benchmark("start", "gpgcache: Using GnuPG to validate signatures")
+        sigs = get_signatures_using_gpg_real(keyid, keyfile, tmpdir, gnupg,
+                                             verify, verbose)
+        benchmark("stop",  "gpgcache: Using GnuPG to validate signatures")
+    if newsigcache is not None:
+        newsigcache[ringhash] = sigs
+        benchmark("tick",  "gpgcache: Caching signatures")
+    if verbose:
+        print "Got verified signatures from sigcache:", sigs
+    return sigs
+
+
 __keycache = [{}, [], 0]
 # This is the slow part. Fetch key, and use gpg to parse it.
 def getsinglekeyfrompks(args, keyid, tmpdir, verbose):
@@ -113,313 +424,29 @@ def getsinglekeyfrompks(args, keyid, tmpdir, verbose):
     sigcache     = args['sigcache']
     newsigcache  = args['newsigcache']
 
-    def splitcolons(string):
-        """Split output from gpg --with-colons.
-        Reverse the quoting from gpg/util/miscutil.c/print_string()"""
-        # Benchmarking this might seem pointless, but emphasizes one
-        # important point: Small string manipulating functions, even
-        # though they do lots of splitting and replacing, doesn't take
-        # any time worth mentioning and would therefore be pointless
-        # to optimize. I like being reminded of this every time I see
-        # the benchmark.
-        benchmark("start", "splitcolons")
-        # Reverse this:
-        #for( ; n; n--, p++ )
-        #  if( *p < 0x20 || (*p >= 0x7f && *p < 0xa0) || *p == delim ||
-        #       (delim && *p=='\\')) {
-        #    putc('\\', fp);
-        #    if     ( *p == '\n' )  putc('n', fp);
-        #    else if( *p == '\r' )  putc('r', fp);
-        #    else if( *p == '\f' )  putc('f', fp);
-        #    else if( *p == '\v' )  putc('v', fp);
-        #    else if( *p == '\b' )  putc('b', fp);
-        #    else if( !*p )         putc('0', fp);
-        #    else fprintf(fp, "x%02x", *p );
-        #  } else putc(*p, fp);
-        # Also see file DETAILS from GnuPG distribution
-        fields = []
-        for x in string.split(":"):
-            tmp = x .replace("\\n", "\n")  \
-                    .replace("\\r", "\r")  \
-                    .replace("\\f", "\f")  \
-                    .replace("\\v", "\v")  \
-                    .replace("\\b", "\b")  \
-                    .replace("\\0", "\x00")\
-                    .split("\\")
-            s = tmp[0]
-            for y in tmp[1:]:
-                assert y[0] == "x"
-                assert len(y) >= 3
-                s += struct.pack('B', int(y[1:3],16)) + y[3:]
-            fields.append(s)
-        benchmark("stop", "splitcolons")
-        return fields
-
-    def call_pksclient_real(db, keyid, keyfile, append=0):
-        v, a, pksflags = "2>/dev/null", ">", ""
-        if verbose:      v = ""
-        if append:       a = ">>"
-        if nopkslogging: pksflags = "t"
-        if eightdigits:
-            keyid = "0x" + keyid[-8:]
-        
-        benchmark("start", "pksclient")
-        benchmark("start", "pksclient: Key ")
-        # Problem: if pksclient is stopped, it will often leave stale
-        # lock files behind. We want to be able to stop the execution
-        # with C-c, but that will stop pksclient. Therefore, we make
-        # sure that pksclient has no controlling terminal.
-        if not os.fork():
-            # We are a child, but we still have a controlling
-            # terminal. Call setsid() to become group/session leader
-            # and get rid of the controlling tty.
-            os.setsid()
-            cmd = "%s %s get %s b%s %s%s %s" % \
-                  (pksclient, db, keyid, pksflags, a, keyfile, v)
-            if verbose:
-                print cmd
-            ret = os.system(cmd)
-            if ret>=256: ret //= 256
-            os._exit(ret) # _exit() won't call cleanup handlers.
-        try:
-            ret = os.wait()[1]
-        except KeyboardInterrupt:
-            print "Keyboard interrupt. Waiting for pksclient to finish."
-            os.wait()
-            print "OK, pksclient has finished. Exiting."
-            sys.exit(1)
-        if ret>=256: ret //= 256
-        benchmark("stop", "pksclient: Key ", "%sfound." % (ret and "not " or ""))
-        benchmark("stop", "pksclient")
-        return not ret
-
-    def call_pksclient(db, keyid, keyfile, append=0):
-        """A caching wrapper around the real call_pksclient()."""
-        benchmark("start", "pksclientcache. Append: %s" % str(append))
-        cache = __keycache[0]
-        if keyid in cache:
-            if not cache[keyid]:
-                benchmark("tick", "pksclientcache: Using cached non-existing key")
-                ret = 0
-            else:
-                benchmark("start", "pksclientcache: Using cached key")
-                if append: mode = 'a'
-                else:      mode = 'w'
-                open(keyfile, mode).write(cache[keyid])
-                ret = 1
-                benchmark("stop",  "pksclientcache: Using cached key")
-        else:
-            benchmark("start", "pksclientcache: Calling pksclient")
-            if append: # Open and seek to end of file
-                f = open(keyfile, 'r')
-                f.seek(0, 2) 
-            if not call_pksclient_real(db, keyid, keyfile, append):
-                # We cache information about key being unavailable
-                # forever - no need to remove it from the cache later,
-                # it is only a few bytes.
-                benchmark("tick", "pksclientcache: Caching non-existant key")
-                cache[keyid] = None
-                ret = 0
-            else:
-                benchmark("start", "pksclientcache: Caching key")
-                if append: # Read only new key
-                    cache[keyid] = f.read()
-                else:
-                    cache[keyid] = open(keyfile, 'r').read()
-                __keycache[1].append(keyid)
-                __keycache[2] += len(cache[keyid])
-                while __keycache[2] > cachesize:
-                    # XXX What is the best strategy here? Let's just use
-                    # FIFO until we know what is best.
-                    # OK, this would probably be faster with a linked
-                    # list, but the list only contains keyids so it is
-                    # quite fast to copy.
-                    remove = __keycache[1].pop(0)
-                    __keycache[2] -= len(cache[remove])
-                    del cache[remove]
-                    benchmark("tick", "pksclientcache: Expiring key from cache")
-                ret = 1
-                benchmark("stop",  "pksclientcache: Caching key")
-            benchmark("stop",  "pksclientcache: Calling pksclient")
-        benchmark("stop", "pksclientcache. Append: %s" % str(append))
-        return ret
-
-    def get_name_using_gpg(keyfile, tmpdir):
-        """Use GPG to extract name and KeyID"""
-        if verbose: v = ""
-        else:       v = "2>/dev/null"
-        benchmark("start", "gpg: get name")
-        cmd = "%s --with-colons " \
-              "--list-keys " \
-              "--homedir %s " \
-              "--keyring %s " \
-              "--no-default-keyring " \
-              "--no-auto-check-trustdb " \
-              "--no-expensive-trust-checks %s" \
-              % (gnupg, tmpdir, keyfile, v)
-        reply = os.popen(cmd)
-        name=keyid=None
-        for x in reply.xreadlines():
-            y = splitcolons(x)
-            if y[0] == "pub":
-                name = y[9].strip()
-                # Make sure we always use GPGs idea of keyid.
-                keyid = "0x" + y[4]
-                if y[1] != "":
-                    benchmark("stop",  "gpg: get name")
-                    return None, None
-                break
-        benchmark("stop",  "gpg: get name")
-        if not isvalidkeyid(keyid):
-            print >>sys.stderr, "Something seems to be wrong in the output when running:"
-            print >>sys.stderr, cmd
-            os._exit(7) # No cleanup will make debugging easier.
-        return keyid, name
-
-    def get_signatures_using_gpg_real(keyid, keyfile, tmpdir, verify):
-        if verbose: v = ""
-        else:       v = "2>/dev/null"
-        if verify:  action = "--check-sigs"
-        else:       action = "--list-sigs"
-        benchmark("start", "gpg: get sigs. Verify: %s" % str(verify))
-        reply = os.popen("%s --with-colons "
-                         "%s "
-                         "--homedir %s "
-                         "--keyring %s "
-                         "--no-default-keyring "
-                         "--no-auto-check-trustdb "
-                         "--no-expensive-trust-checks "
-                         "--fixed-list-mode %s %s"
-                         % (gnupg, action, tmpdir, keyfile, keyid, v))
-        # OK, parse the GPG output.
-        uidsigs   = {} # Number of times this signature appears (decreased if rev)
-        uidsiglvl = {} # Maximum cert check level for this signature
-        sigs      = {} # The real signatures we return
-        # I can't find this explicitly in the GnuPG documentation, but
-        # reading between the lines, it is quite clear that the first
-        # user ID is the primary one.
-        primary_uid = 2
-        for x in reply.readlines() + ["sub"]:
-            y = splitcolons(x)
-            if   y[0] == "uid" or y[0] == "sub":          # Start/end of user ID
-                if keyid in uidsigs and uidsigs[keyid]>0:  # If self-signed
-                    del uidsigs[keyid]                      # Remove self-signature
-                    for z in uidsigs:
-                        if uidsigs[z] > 0:                  # For non-revoked sigs
-                            if z not in sigs or sigs[z] < uidsiglvl[z]:
-                                sigs[z] = uidsiglvl[z]      # Update sigs with new or higher levels
-                uidsigs, uidsiglvl = {}, {}
-                if primary_uid: primary_uid -= 1
-            elif y[0] == "sig":    # Signature
-                if verify and y[1] != "!":   # Invalid signature
-                    #if y[1] != "?":
-                    #    print "0x" + keyid + ": " + x[:-1]
-                    continue
-                key = "0x" + y[4]
-                lvl = int(y[10][1], 16)
-                if lvl > 3:    # Ignore direct-key signatures.
-                    continue
-                if primary_uid: lvl += 4 # Add 4 if primary UID is signed.
-                if key not in uidsigs: uidsigs[key]  = 1
-                else:                  uidsigs[key] += 1
-                if key not in uidsiglvl or uidsiglvl[key] < lvl:
-                    uidsiglvl[key] = lvl # Update uidsiglvl with new or higher levels
-            elif y[0] == "rev": # Revoked signature
-                key  = "0x" + y[4]
-                if key not in uidsigs: uidsigs[key]  = -1
-                else:                  uidsigs[key] -=  1
-            if y[0] == "sub":  # Stop processing when we get to subkeys.
-                break
-        benchmark("stop", "gpg: get sigs. Verify: %s" % str(verify))
-        return sigs
-
-    def get_signatures_using_gpg(keyid, keyfile, tmpdir, verify):
-        """A caching wrapper around the real get_signatures_using_gpg()."""
-        # There are three cases where a signature can become invalid:
-        # 1. The signed key becomes invalid (revoked, expired)
-        # 2. The signature itself becomes invalid (revoked, expired)
-        # 3. The signing key becomes invalid (revoked, expired)
-        # This means that we never have to validate the signatures
-        # using both keys _at the same time_ to detect that a
-        # signature has become invalid. If we always run every key on
-        # it's own through gnupg, we detect cases 1 and 2 when running
-        # the signed key and 3 when running the signing key. We need
-        # only re-verify signatures using gpg when the signed key has
-        # changed. If signed key is unchanged, we can use the last
-        # signature list as candidates and count on invalid keys being
-        # removed later.
-
-        # Similarily, there are three cases where a signature becomes valid:
-        # 1. The signed key becomes valid (i.e. added self-signature)
-        # 2. The signature gets added
-        # 3. The signing key becomes valid (new self-signature or just uploaded)
-        # 1 and 2 both modifies the signed key. Unfortunately, 3 does
-        # not. It should be possible to verify only those signatures
-        # where the signing key has changed, but that is complicated. 
-        # Instead we verify all signatures on a key iff the signed key
-        # or any of the signing keys are modified. Some signatures
-        # will be re-verified without being strictly needed, but
-        # changes are probably rare enough to not impact speed
-        # noticably anyway.
-
-        # Conclusion: If not verifying signatures, don't use cache. If
-        # verifying signatures, calculate SHA1-sum of the whole
-        # keyring. If unchanged, use cached list of signatures.
-
-        # This approach should produce identical results as using no
-        # cache if this is true:
-        # If (gpg --check-sigs have previously verified a signature) and
-        #    (no key, just the time, has changed since verification) then:
-        #  (
-        #    if (gpg --list-keys sees nothing wrong with the signed key) and
-        #       (gpg --list-sigs sees nothing wrong with the signed key
-        #                                             or the signature) and
-        #       (gpg --list-keys sees nothing wrong with the signing key)
-        #     then and only then:
-        #         (gpg --check-sigs will verify the signature)
-        #  )
-        # If this should be false, I'd like to know about it.
-
-        if not verify:
-            return get_signatures_using_gpg_real(keyid,keyfile,tmpdir,verify)
-        if sigcache or newsigcache is not None:
-            benchmark("start", "gpgcache: Calculating SHA1-sum for keyring")
-            import sha
-            ringhash = sha.sha(open(keyfile).read()).digest()
-            benchmark("stop",  "gpgcache: Calculating SHA1-sum for keyring")
-        else:
-            ringhash = None
-        if ringhash in sigcache:
-            benchmark("tick",  "gpgcache: Using cached signatures")
-            sigs  = sigcache[ringhash]
-        else:
-            benchmark("start", "gpgcache: Using GnuPG to validate signatures")
-            sigs = get_signatures_using_gpg_real(keyid,keyfile,tmpdir,verify)
-            benchmark("stop",  "gpgcache: Using GnuPG to validate signatures")
-        if newsigcache is not None:
-            newsigcache[ringhash] = sigs
-            benchmark("tick",  "gpgcache: Caching signatures")
-        return sigs
-
-    # OK, no more defining functions.
-
-    if not call_pksclient(pksdb, keyid, "%s/key" % tmpdir, 0):
+    if not call_pksclient(pksdb, keyid, "%s/key" % tmpdir, pksclient,
+                          cachesize, 0, nopkslogging, verbose, eightdigits):
         benchmark("stop", "getsinglekeyfrompks()")
         return None
 
-    newkeyid, name = get_name_using_gpg("%s/key" % tmpdir, tmpdir)
+    newkeyid, name = get_name_using_gpg("%s/key" % tmpdir, tmpdir, gnupg,
+                                        verbose)
     if not name:
         benchmark("tick", "getsinglekeyfrompks: Ignoring invalid or revoked key.")
         benchmark("stop", "getsinglekeyfrompks()")
         return None
 
-    sigs=get_signatures_using_gpg(newkeyid, "%s/key"%tmpdir, tmpdir, 0)
+    sigs=get_signatures_using_gpg(newkeyid, "%s/key" % tmpdir, tmpdir, gnupg,
+                                  0, sigcache, newsigcache, verbose)
     if verify:
         benchmark("start", "verify signatures")
         # A keyring is created by concatenating the binary keys.
         for sig in sigs:
-            call_pksclient(pksdb, sig, "%s/key" % tmpdir, 1)
-        sigs = get_signatures_using_gpg(newkeyid, "%s/key"%tmpdir, tmpdir, 1)
+            call_pksclient(pksdb, sig, "%s/key" % tmpdir, pksclient,
+                           cachesize, 1, nopkslogging, verbose, eightdigits)
+        sigs = get_signatures_using_gpg(newkeyid, "%s/key" % tmpdir, tmpdir,
+                                        gnupg, 1, sigcache, newsigcache,
+                                        verbose)
         benchmark("stop", "verify signatures")
 
     benchmark("stop", "getsinglekeyfrompks()")
@@ -435,7 +462,8 @@ def getkeyfromdict(dict, key, tmpdir=None, verbose=0):
     else:
         return None
 
-def getwot(startkeys, getkeyfunc, getkeyarg, verbose, slow=0, printevery=100):
+def getwot(startkeys, getkeyfunc, getkeyarg, verbose, slow=0, printevery=100,
+           debuglimit=None):
     """Get the whole strong set. Can take some time to complete"""
 
     # GPG needs a home directory. We want it to be empty, so nothing is
@@ -460,6 +488,12 @@ def getwot(startkeys, getkeyfunc, getkeyarg, verbose, slow=0, printevery=100):
     
         nexttoprint = totalcount = lastok = 0
         while keystocheck:
+
+            if debuglimit is not None:
+                if debuglimit == 0:
+                    break
+                debuglimit -= 1
+
             # XXX This is depth first. This is probably fastest, but
             # I'm not completely sure. Just s/pop()/pop(0)/ to turn
             # this into width first.
@@ -478,6 +512,8 @@ def getwot(startkeys, getkeyfunc, getkeyarg, verbose, slow=0, printevery=100):
                 totalcount += 1
                     
             ret = getkeyfunc(getkeyarg, key, tmpdir, verbose)
+            if verbose:
+                print "getkeyfunc returned %r." % ret
     
             # Don't bother with broken and unsigned keys
             if not ret:
@@ -657,7 +693,7 @@ def main(argv):
         print "           Explicitly set path to pksclient or gpg. Default is to"
         print "           let a shell find them in $PATH."
         print " --nopkslogging"
-        print "           Pass the `t' flag to pksclient, making it run without"
+        print "           Pass the 't' flag to pksclient, making it run without"
         print "           logging and transactions. This is faster, but less safe."
         print "           Use only if noone else is accessing the database."
         print " --eightdigits"
@@ -682,12 +718,15 @@ def main(argv):
         print "           (SHA1-sum of) keys are not processed by gnupg again."
         print "           FILE does not need to exist. It is overwritten or created"
         print "           with new data on exit."
+        print " --debuglimit=N"
+        print "           If set, limit the number of processed keys to this number."
         sys.exit(1)
 
     try:
         opts, args = getopt.gnu_getopt(argv[1:], "ncvw:r:",
                    ['pksclient=', 'gnupg=', 'nopkslogging', 'eightdigits',
-                    'startkeys=', 'feedback=', 'cachesize=', 'sigcache='])
+                    'startkeys=', 'feedback=', 'cachesize=', 'sigcache=',
+                    'debuglimit='])
     except getopt.GetoptError:
         usage()
 
@@ -703,7 +742,6 @@ def main(argv):
     # Some keys in the strong set to start from.
     startkeys  = ["0x013C5083E8C80C34",
                   "0xA8D947F9ED9547ED",
-                  "0x63CB691DFAEBD5FC",
                   "0xA8919F49D23450F9"]
     verify       = 1
     verbose      = None
@@ -715,6 +753,7 @@ def main(argv):
     printevery   = 100
     cachesize    = 50*2**20
     sigcachefile = None
+    debuglimit   = None
     for o, a in opts:
         if   o == '-n':
             verify = 0
@@ -747,6 +786,8 @@ def main(argv):
             cachesize = int(float(a)*2**20)
         elif o == '--sigcache':
             sigcachefile = a
+        elif o == '--debuglimit':
+            debuglimit = int(a)
 
     begintime = time.time()
     debug("We are running on %s." % sys.platform)
@@ -756,7 +797,12 @@ def main(argv):
     debug("GnuPG version:")
     for line in os.popen("%s --version"%gnupg).xreadlines():
         debug("  " + line[:-1])
-    debug("pksclient version is unknown. (Please implement pksclient --version.)")
+    debug("pksclient version:")
+    for line in os.popen("%s --version 2>&1" % pksclient).xreadlines():
+        if line.startswith("%s /db/path " % pksclient):
+            debug("  [[Unknown version. Please implement pksclient --version.]]")
+            break
+        debug("  " + line[:-1])
     debug("")
     debug("Starting to fetch signatures from the key server.")
     debug("Now is %s local time." % time.ctime(begintime))
@@ -805,7 +851,8 @@ def main(argv):
     if debugdump != "r":
         (sigdict,namedict) = getwot(startkeys, getsinglekeyfrompks,
                                     getkeyarg, verbose, slow=1,
-                                    printevery=printevery)
+                                    printevery=printevery,
+                                    debuglimit=debuglimit)
     else:
         import cPickle
         debug("Reading pickled state from %s." % debugfile)

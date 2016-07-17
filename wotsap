@@ -21,6 +21,29 @@
 # Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
 # 02111-1307, USA.
 
+# This file also contains a font extracted from the Debian package
+# xfonts-75dpi:
+# Copyright 1984-1989, 1994 Adobe Systems Incorporated.
+# Copyright 1988, 1994 Digital Equipment Corporation.
+#
+# Adobe is a trademark of Adobe Systems Incorporated which may be
+# registered in certain jurisdictions.
+# Permission to use these trademarks is hereby granted only in
+# association with the images described in this file.
+# 
+# Permission to use, copy, modify, distribute and sell this software
+# and its documentation for any purpose and without fee is hereby
+# granted, provided that the above copyright notices appear in all
+# copies and that both those copyright notices and this permission
+# notice appear in supporting documentation, and that the names of
+# Adobe Systems and Digital Equipment Corporation not be used in
+# advertising or publicity pertaining to distribution of the software
+# without specific, written prior permission.  Adobe Systems and
+# Digital Equipment Corporation make no representations about the
+# suitability of this software for any purpose.  It is provided "as
+# is" without express or implied warranty.
+
+
 # We need the yield keyword in 2.2.
 from __future__ import generators
 
@@ -34,7 +57,7 @@ def __tmp(): yield \
     '*********** Too old Python. You need at least version 2.2.0. ***********'
 del __tmp
 
-VERSION="0.6"
+VERSION="0.7"
 
 defaultconfig = {
     "size":     (980, 700),
@@ -66,6 +89,7 @@ import struct
 import math
 import re
 import random
+import codecs
 
 # How cert levels are presented
 clascii = "abcd0123?!U"
@@ -90,6 +114,25 @@ class wotKeyNotFoundError(wotError):
         self.key = key
     def __unicode__(self):
         return u'Key not found: "%s"' % self.key
+class wotPathNotFoundError(wotError):
+    """Exception raised when no path is found.
+    Attributes:
+        bottom -- The bottom key
+        top    -- The top key
+        mod    -- Modstring
+    """
+    def __init__(self, bottom, top, mod=None):
+        self.bottom = bottom
+        self.top    = top
+        self.mod    = mod
+    def __unicode__(self):
+        r = u'Path not found: "%s" to "%s" ' % (self.bottom, self.top)
+        if self.mod is not None:
+            r += u"Using modstring:\n%s" % unicode(self.mod)
+        else:
+            r += u"without modstring."
+        return r
+    
 class wotLoadFileError(wotError):
     """Exception raised when loading a .wot file failed.
     Attributes:
@@ -337,7 +380,7 @@ def loadfile(wotfilename):
         raise wotLoadFileError, str
 
     try:
-        f = open(wotfilename)
+        f = open(wotfilename, "rb")
     except IOError, (errno, strerror):
         error(u'Unable to open file "%s": %s' % (wotfilename, strerror))
 
@@ -348,7 +391,7 @@ def loadfile(wotfilename):
         error(u'Unable to read from file "%s": %s' % (wotfilename, strerror))
 
     if s != header:
-        f = os.popen('bunzip2 < "%s"' % wotfilename)
+        f = os.popen('bunzip2 < "%s"' % wotfilename, "rb")
         s = f.read(len(header))
         if s != header:
             error(u"%s does not look like a .wot file." % wotfilename)
@@ -562,9 +605,9 @@ def findpaths(wot, bottom, top, mod):
                 ret.append( findnext(ret[-1], w))
             return ret
         if len(conn[-1]) == 0:
-            return None
+            raise wotPathNotFoundError(bottom, top, mod)
         seen.update(conn[-1])
-    return None
+    raise wotPathNotFoundError(bottom, top, mod)
 
 # This function is actually slightly slower than the real msd() now.
 def __msd_standalone(wot, key):
@@ -635,7 +678,10 @@ def fullkey(wot, key, certlvl=None, alt=None):
     if certlvl is not None:
         c = u"%s " % clascii[certlvl]
     if key is not None:
-        return u"%s0x%s %s" % (c, key2str(wot.keys[key]), wot.names[key])
+        name = wot.names[key]
+        if wot.obfuscateemail:
+            name = name.replace('@', wot.obfuscatewith)
+        return u"%s0x%s %s" % (c, key2str(wot.keys[key]), name)
     else:
         if alt is not None:
             return u'[Key %s not found]' % alt
@@ -748,7 +794,19 @@ def keystats(wot, key, mod=None, wanted=0, restrict=None, timer=None):
         if not conn:
             break
         seen.update(conn)
-    downtrace += u"Total number of keys in strong set: %6d\n" % len(wot.keys)
+    if not mod:
+        downtrace += u"Total number of keys in strong set: %6d\n" % len(wot.keys)
+    else:
+        seenup = {key: None}
+        conn   = {key: None}
+        for lev in xrange(100):
+            conn = findnext(conn, wot.sigs[UP], seenup, mod, UP)
+            seenup.update(conn)
+        both = len([None for x in seen if x in seenup])
+        downtrace += u"Total number of keys reaching this key:                       %6d\n" % len(seen)
+        downtrace += u"Total number of keys reachable by this key:                   %6d\n" % len(seenup)
+        downtrace += u"Total number of keys both reachable by and reaching this key: %6d\n" % both
+        downtrace += u"Total number of keys in strong set without modstring:         %6d\n" % len(wot.keys)
 
     msds  = u"Mean shortest distance:                  %2.4f\n" % \
            (totalweighted / total)
@@ -777,7 +835,7 @@ def keystats(wot, key, mod=None, wanted=0, restrict=None, timer=None):
     footer = u"Other report for this key are available:\n" \
              u"  http://keyserver.kjsl.com/~jharris/ka/current/%s/%s\n" \
              u"  http://thomas.butter.dk/gpg/getmsd.php?key=%s\n" \
-             u"  http://www.cs.uu.nl/~henkp/henkp/pgp/pathfinder/mk_path.cgi?FROM=%s&STATS=statistics\n" %\
+             u"  http://pgp.cs.uu.nl/stats/%s.html\n" %\
              (key2str(wot.keys[key]).upper()[:2],\
               key2str(wot.keys[key]).upper()    ,\
               key2str(wot.keys[key]).upper()    ,\
@@ -1137,6 +1195,18 @@ def print_wot(wot):
         for line in print_key(wot, key, u"", u"  "):
             yield line
 
+def print_dot(wot):
+    """Print all keys and signatures in dot file."""
+
+    yield "digraph \"Keyring signatures\" {"
+    for key in xrange(len(wot.keys)):
+        yield '"%s" [label="%s"]' % (key2str(wot.keys[key]), wot.names[key].replace("\"", "\\\""))
+        sigs = wot.sigs[DN][key]
+        siglist = list(sigs)
+        for signedby in siglist:
+           yield '"%s" -> "%s"' % (key2str(wot.keys[signedby]), key2str(wot.keys[key]))
+    yield "}"
+
 # XXX If onlykeys, show differences in both directions?
 def diff_wots(wot0, wot1, onlykeys=None):  
     """Print differences between two web-of-trusts."""
@@ -1151,8 +1221,8 @@ def diff_wots(wot0, wot1, onlykeys=None):
     yield u"Debug:"
     wot0debug = wot0.debug or "\ [No debug information found]\n"
     wot1debug = wot1.debug or "\ [No debug information found]\n"
-    for line in difflib.ndiff(wot0debug.splitlines(1),
-                              wot1debug.splitlines(1)):
+    for line in difflib.unified_diff(wot0debug.splitlines(1),
+                                     wot1debug.splitlines(1)):
         yield line[:-1]
 
     # Diff the READMEs
@@ -1350,7 +1420,8 @@ class Mod:
                             .replace("]","\]").replace("^","\^"))
     
     def __init__(self, wot, modstr):
-        self.wot = wot
+        self.wot      = wot
+        self.modstr   = modstr
         self.exclunlk = 0
         self.exclsigs, self.exclkeys, \
                        self.excllvls, self.add_sigs, self.add_keys = {},{},{},{},{}
@@ -1383,7 +1454,7 @@ class Mod:
                 e(u'"%s"'%arg)
     
     def __str__(self):
-        ret = u""
+        ret = u'Modstring: "%s"\n' % self.modstr
         for x in self.exclsigs:
             ret += u"Excluded signature %s -> %s\n" % (fullkey(self.wot, x[0]),
                                                        fullkey(self.wot, x[1]))
@@ -1404,16 +1475,19 @@ class Wot:
     """Don't think the module and class interfaces are stable. They
     are not. There are lots of things that needs cleanup first."""
 
-    def __init__(self, dumpfile, fontfile=None):
-        if fontfile:
-            init_pil_get_logo()
-            self.initfont(fontfile)
+    def __init__(self, dumpfile, fontfile=None,
+                 obfuscateemail=False, obfuscatewith='(%)',
+                 ttffile=None, ttfsize=16):
+        if fontfile or ttffile:
+            self.initfont(fontfile, ttffile, ttfsize)
         self.sigs = range(2)
         self.loadfile(dumpfile)
         self.sigs[UP] = reversesigs(self.sigs[DN])
         self.numofsigs = 0
         for x in self.sigs[UP]:
             self.numofsigs += len(x)
+        self.obfuscateemail = obfuscateemail
+        self.obfuscatewith  = obfuscatewith
 
     def __len__(self):
         return len(self.keys)
@@ -1423,9 +1497,12 @@ class Wot:
          self.filename, self.fileversion, self.debug) = loadfile(dumpfile)
 
     # XXX Don't make the same mistake as PIL makes, and only take filename.
-    def initfont(self, fontfile=None):
+    def initfont(self, fontfile=None, ttffile=None, ttffilesize=16):
         init_pil_get_logo()
 
+        if ttffile:
+            self.font = ImageFont.truetype(ttffile, ttffilesize)
+            return
         if fontfile:
             self.font = ImageFont.load(fontfile)
             return
@@ -1455,8 +1532,8 @@ class Wot:
                   "Warning: Old PIL version, using temp files %s and %s." %\
                   ( f0, f1)
             try:
-                open(f0, "w").write(pilstr)
-                open(f1, "w").write(pbmstr)
+                open(f0, "wb").write(pilstr)
+                open(f1, "wb").write(pbmstr)
                 self.font = ImageFont.load("/tmp/pilfonthack.pil")
             finally:
                 for f in f0, f1:
@@ -1505,7 +1582,8 @@ class Wot:
     def wotstats(self):
         return wotstats(self)
 
-    def groupmatrix(self, keys, searchstring=None, modstring=None, maxkeys=200):
+    def groupmatrix(self, keys, searchstring=None, modstring=None,
+                    nounknowns=0, maxkeys=200):
         if keys:
             keys = [(nametokey(self, key), key) for key in keys.split(",")]
         else:
@@ -1515,6 +1593,8 @@ class Wot:
             if len(skeys) > maxkeys:
                 raise wotTooManyError(len(skeys))
             keys += [(key, "%s not found"%searchstring) for key in skeys]
+        if nounknowns:
+            keys = [(k, s) for (k, s) in keys if k is not None]
         for line in groupmatrix(self, keys, modstring):
             yield line
 
@@ -1556,12 +1636,17 @@ def wotsapmain(argv):
             u"                     Defaults to ~/.wotsapdb\n" \
             u"  -m, --modify=STR   Use STR as wot modification string.\n" \
             u"  -g, --group        Print signature matrix of comma separated keys.\n" \
+            u"  -G, --nounknowns   Don't print unknown keys in signature matrix.\n" \
             u"  -o, --png=FILE     Write .png output to FILE.\n" \
             u"  -O, --show-png=PRG Use PRG to view (temporary) PNG image\n" \
+            u"  -s, --size=NNNxMMM Set image size to NNN times MMM.\n" \
             u"  -F, --font=FILE    (Only needed in png output) Font file in .pil/.pbm format.\n" \
             u"                     Point it to the .pil file, with the .pbm file in the same\n" \
-            u"                     directory. Defaults to ~/.wotsapfont.pil\n" \
+            u"                     directory.\n" \
+            u"  -T, --ttffont=FILE As -F but with a TrueType font file.\n" \
+            u"  -S, --ttfsize=num  Size to use for TrueType font. Defaults to 16.\n" \
             u"  -p, --print        Print the whole web-of-trust in human readable format.\n" \
+            u"  -e, --export=FILE  Export the whole web-of-trust to DOT file.\n" \
             u"  -D, --print-debug  Print the debug information in the .wot file.\n" \
             u"  -d, --diff=FILE    Print all differences between two .wot files.\n" \
             u"  -M, --msd          Just show MSD for key.\n" \
@@ -1587,15 +1672,18 @@ def wotsapmain(argv):
         else:
             gopt = getopt.getopt
         opts, args = gopt(argv[1:],
-                          "hw:m:go:O:F:pDd:MW:r:",
-                          ["help", "wot=", "modify=", "group", "png=", "show-png=",
-                           "font=", "print", "print-debug", "diff=", "version",
-                           "msd", "wanted=", "restrict="])
+                          "hw:m:gGo:O:s:F:pDd:MW:r:T:S:e:",
+                          ["help", "wot=", "modify=", "group", "nounknowns", "png=",
+                           "show-png=", "size=", "font=", "print", "print-debug",
+                           "diff=", "version", "msd", "wanted=", "restrict=",
+                           "ttffont=", "ttfsize=", "export="])
     except getopt.GetoptError:
         usage(2)
 
     wotfile    = os.path.expanduser("~/.wotsapdb")
     fontfile   = None
+    ttffile    = None
+    ttfsize    = 16
     group      = None
     pngfile    = None
     modifystr  = None
@@ -1606,6 +1694,9 @@ def wotsapmain(argv):
     prnt       = 0
     prnt_debug = 0
     diff       = None
+    size       = None
+    nounknowns = 0
+    dot        = None
     for o, a in opts:
         if   o in ("-h", "--help"):
             usage(0)
@@ -1617,14 +1708,24 @@ def wotsapmain(argv):
             modifystr = a
         elif o in ("-g", "--group"):
             group = 1
+        elif o in ("-G", "--nounknowns"):
+            nounknowns = 1
         elif o in ("-o", "--png"):
             pngfile = a
         elif o in ("-O", "--show-png"):
             pngprg = a
+        elif o in ("-s", "--size"):
+            size = a
         elif o in ("-F", "--font"):
             fontfile = a
+        elif o in ("-T", "--ttffile"):
+            ttffile = a
+        elif o in ("-S", "--ttfsize"):
+            ttfsize = float(a)
         elif o in ("-p", "--print"):
             prnt=1
+        elif o in ("-e", "--export"):
+            dot = a
         elif o in ("-D", "--print-debug"):
             prnt_debug=1
         elif o in ("-d", "--diff"):
@@ -1654,7 +1755,8 @@ def wotsapmain(argv):
     except wotLoadFileError, err:
         print unicode(err).encode(encoding, 'replace')
         print "You need a .wot file which contains the list of keys and signatures."
-        print "You can download http://www.lysator.liu.se/~jc/wotsap/wots/latest.wot"
+        print "You can download the latest .wot file from"
+        print "  http://www.lysator.liu.se/~jc/wotsap/wots2/latest.wot"
         print "and either name it ~/.wotsapdb or give the filename as the -w argument."
         sys.exit(1)
 
@@ -1662,7 +1764,13 @@ def wotsapmain(argv):
         if bottom:
             print >>sys.stderr, u"Please supply one argument only."
             sys.exit(7)
-        for line in wot.groupmatrix(top):
+        if "," in top:
+            keys         = top
+            searchstring = None
+        else:
+            keys         = None
+            searchstring = top
+        for line in wot.groupmatrix(keys, searchstring=searchstring, nounknowns=nounknowns):
             print line.encode(encoding, 'replace')
         sys.exit(0)
 
@@ -1725,6 +1833,13 @@ def wotsapmain(argv):
             print line.encode(encoding, 'replace')
         sys.exit(0)
 
+    if dot:
+        fdot = codecs.open(dot, encoding='utf-8', mode='w')
+        for line in print_dot(wot):
+            print >>fdot, line
+        fdot.close
+        sys.exit(0)
+
     if top and bottom:
         try:
             web = wot.findpaths(bottom, top, modstr=modifystr)
@@ -1739,8 +1854,11 @@ def wotsapmain(argv):
         print wot.creategraph(web, format='txt').encode(encoding, 'replace')
 
         if pngfile or pngprg:
-            wot.initfont(fontfile)
-            ret = wot.creategraph(web, format="PIL")
+            config = {}
+            if size is not None:
+                config['size'] = tuple([int(i) for i in size.split('x')])
+            wot.initfont(fontfile, ttffile, ttfsize)
+            ret = wot.creategraph(web, format="PIL", config=config)
             if pngprg and not pngfile:
                 import tempfile
                 # Python 2.2 doesn't have mkstemp.
@@ -1751,7 +1869,7 @@ def wotsapmain(argv):
 
             print >>sys.stderr, "Writing .png file %s: " % pngfile,
             try:
-                f = open(pngfile, "w")
+                f = open(pngfile, "wb")
             except IOError, (errno, strerror):
                 print >>sys.stderr, \
                       'Unable to open file: %s' % strerror

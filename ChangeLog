@@ -1,17 +1,51 @@
+
+2013-02-16  Jörgen Cederlöf  <jc@lysator.liu.se>
+	Release 0.7
+
+	Most of these changes are somewhat old and have been running on
+	the online service for quite some time. This is an incomplete
+	list:
+
+        * pks2wot:
+                     - Some typo fixes.
+                     - Check expiration of signatures.
+                     - Removed Zimmerman's key 0x63CB691DFAEBD5FC from
+                         startkeys, since it has signed noone.
+                     - Use pksclient --version.
+        * wotsap:
+                     - Some URL changes in documentation texts.
+                     - Open files in binary mode, to make it work on Microsoft
+                         systems.
+                     - Use unified_diff instead of ndiff for debug info. ndiff
+                         is very very slow (years?) for the debug data.
+                     - Optional email obfuscation
+                     - Show information about reaching/reachable/strong set
+                         with modstring.
+                     - Added --size option.
+                     - Added --nounknowns option.
+                     - Made --group do search if key string doesn't contain a
+                         comma.
+                     - Some small improvements of e.g. error handling.
+                     - Optionally use TrueType font.
+                     - DOT file export by
+                         Aleksey Shipilev <aleksey.shipilev@gmail.com>
+
 2004-12-12  Jörgen Cederlöf  <jc@lysator.liu.se>
+        Release 0.6
+        
         Loads of changes, too many to list in detail, most of them
         actually implemented some time ago. Everything is optimized for
         Python 2.3 and should work on Python 2.4 but still has
         compatibility for Python 2.2.
 
-        * pks2wot.py:
+        * pks2wot:
                      - All keys and signatures verified with GnuPG
                      - Always use primary user ID
                      - Indicate if primary user ID is signed
                      - Save signature type
                      - New .wot file format including signature types
                      - Safe caching and other speedups
-        * wotsap.py:
+        * wotsap:
                      - Handle new .wot file format
                      - Most Wanted patch by Marco Bodrato
                      - Group matrix

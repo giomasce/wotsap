@@ -20,7 +20,7 @@
 # Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
 # 02111-1307, USA.
 
-dumpfile   = "/web/users/roxen_only/jc/wotsap/wots/latest.wot"
+dumpfile   = "/home/jc/wots/latest.wot"
 
 url = "http://webware.lysator.liu.se/jc/"
 
@@ -35,6 +35,7 @@ import sys
 import os
 import wotsap
 import re
+import time
 
 # _foo=[bar] arguments is an idiom for static variables.
 # An argument gets its default value only once, so if it is mutable it
@@ -46,7 +47,7 @@ import re
 def getlatestwot(path=dumpfile, _lastmtime=[0], _wot=[None]):
     if os.lstat(path).st_mtime != _lastmtime[0]:
         _lastmtime[0]   = os.lstat(path).st_mtime
-        wot = wotsap.Wot(path)
+        wot = wotsap.Wot(path, obfuscateemail=True)
         wot.initfont()
         _wot[0]  = wot
     return _wot[0]
@@ -172,7 +173,7 @@ def handleurl(urlpath, fields, write, setheader, redirect, urlencode):
             # but write seems to be sufficient.
             write = tmpwrite
         graph.save(tmpfile, 'png')
-    elif matches('^wotsap/wots/latest/groupmatrix/%s(,%s)*\\.txt$'%(kre,kre)):
+    elif matches('^wotsap/wots/latest/groupmatrix/.*\\.txt$'):
         checkfields(['modstring'])
         keys = urlpath[31:-4]
         setheader('Content-type', 'text/plain; charset=utf-8')
@@ -199,7 +200,12 @@ def handleurl(urlpath, fields, write, setheader, redirect, urlencode):
         args = checkfields(['modstring'], ['keys'])
         namelist = fields['keys'].split(',')
         if len(namelist) > 1:
-            keys = ','.join([wot.nametokey(name) for name in namelist])
+            def nametokey(name):
+                try:
+                    return wot.nametokey(name)
+                except wotsap.wotKeyNotFoundError:
+                    return name
+            keys = ','.join([nametokey(name) for name in namelist])
             redirect(url+"wotsap/wots/latest/groupmatrix/%s.txt"%keys +args)
         else:
             setheader('Content-type', 'text/plain; charset=utf-8')
@@ -222,7 +228,8 @@ def errorwrapper(urlpath, fields, write, setheader, sendredirect, urlencode):
     try:
         return handleurl(urlpath, fields, write, setheader, sendredirect, urlencode)
     except (ValueError, NotImplementedError, wotsap.wotTooManyError,
-            wotsap.wotKeyNotFoundError, wotsap.wotModstringError), err:
+            wotsap.wotKeyNotFoundError, wotsap.wotPathNotFoundError,
+            wotsap.wotModstringError), err:
         setheader('Content-type', 'text/plain; charset=utf-8')
         write(unicode(err).encode('utf-8', 'replace'))
 
@@ -240,6 +247,11 @@ class Main(Page):
         fields       = self.request().fields()
         urlpath      = self.request().originalURLPath() 
         write        = self.write
+
+	# TODO: Try to log more. Full GET line? Complete raw headers?
+	print 'Recived request at %s from %r: %r %r' % (
+           time.strftime('%Y-%m-%d_%H:%M:%S'), request.remoteAddress(),
+           urlpath, fields)
 
         # Useful when debugging:
         #def sendredirect(url):
@@ -263,5 +275,10 @@ class Main(Page):
         # exists if someone wants to make it more stable.
         urlpath = urlpath.decode('iso-8859-1', 'replace')
         for key in fields: # The field names themselves are ascii.
+            # If a field is supplied more than once, Webware gives us
+            # a list of strings instead of a string. We use the last
+            # one.
+            if type(fields[key]) is type([]):
+                fields[key] = fields[key][-1]
             fields[key] = fields[key].decode('iso-8859-1', 'replace')
         return errorwrapper(urlpath, fields, write, setheader, sendredirect, urlencode)
