@@ -1,0 +1,70 @@
+
+      The Web of Trust .wot file format, version 0.1
+
+
+1. Overview
+
+To stimulate statistics and analyzes of the OpenPGP Web of Trust, a
+file format is proposed to carry information about key IDs, names and
+signatures, in files small enough to be easily downloaded by anyone.
+
+Because the OpenPGP Web of Trust is supposed to grow a lot, the file
+format is designed with compressed size as first priority. Key IDs and
+names are specified only once. The signatures are specified using
+sorted lists of indices into the key list. Similar data is close
+together. The result is a format which can store the current (Mars
+2003) strongly connected set in less than 0.5 MiB.
+
+The first system to use this file format is Wotsap,
+http://www.lysator.liu.se/~jc/wotsap/.
+
+This file is available at
+http://www.lysator.liu.se/~jc/wotsap/wotfileformat.txt
+
+
+2. File format
+
+A wot file is a bzip2-compressed ar-archive. All texts are coded using
+UTF-8, and all integers are in network byte order. The archive
+contains these files, in this order:
+
+"README":
+
+  A short text describing what kind of file this is, and where and
+  when it was generated.
+
+"WOTVERSION":
+
+  The version of this specification, followed by a newline. Currently
+  "0.1\n".
+
+"names"
+
+  One string specifying the name (one of the user IDs) of each key. 
+  Each name is followed by a newline.
+
+"keys"
+
+  Four bytes specifying the key ID of each key. The keys are in the
+  same order as in the "names" file.
+
+"signatures"
+
+  For each key, a list specifying the keys that has signed this key. 
+  The list elements are 4-byte indices into the above lists. The lists
+  are in the same order as in the above files. The lists are separated
+  by 0xFFFFFFFF.
+
+
+4. Future extensions
+
+Future versions will, if possible, only add new files to the archive. 
+Such versions will have version numbers 0.1.x. Current implementations
+must be able to read these files, by ignoring the extra files. If
+incompatible changes are introduced, the version number will change to
+0.2.
+
+
+5. Author and date
+
+Jörgen Cederlöf <jc@lysator.liu.se>, 2003-03-26
