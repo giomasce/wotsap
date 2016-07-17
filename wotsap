@@ -1545,7 +1545,7 @@ def wotsapmain(argv):
         elif o in ("-T", "--ttffile"):
             ttffile = a
         elif o in ("-S", "--ttfsize"):
-            ttfsize = float(a)
+            ttfsize = int(a)
         elif o in ("-p", "--print"):
             prnt=1
         elif o in ("-e", "--export"):
