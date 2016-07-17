@@ -1,0 +1,1793 @@
+#!/usr/bin/env python
+# -*- coding: iso-8859-1 -*-
+
+# Web of trust statistics and pathfinder, Wotsap
+# http://www.lysator.liu.se/~jc/wotsap/
+# Copyright (C) 2003,2004  Jörgen Cederlöf <jc@lysator.liu.se>
+# modified 2004 by Marco Bodrato <gpg@bodrato.it> ("wanted sigs")
+# 
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+# General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
+# 02111-1307, USA.
+
+# We need the yield keyword in 2.2.
+from __future__ import generators
+
+# New (3.0) division syntax is more intiutive.
+from __future__ import division
+
+
+# Try to make error messages from old Python versions show something
+# meaningful.
+def __tmp(): yield \
+    '*********** Too old Python. You need at least version 2.2.0. ***********'
+del __tmp
+
+VERSION="0.6"
+
+defaultconfig = {
+    "size":     (980, 700),
+    "arrowlen": 18,
+    "arrowang": 23,
+    "colors":   [0x9d, 0xaf, 0x75,  # Background          (col_bg)
+                 0xc0, 0xc0, 0xff,  # Box interiors       (col_boxi)
+                 0x00, 0x00, 0x00,  # Font                (col_font)
+                 0x00, 0x00, 0x00,  # Lines               (col_line)
+                 0x00, 0x00, 0x00,  # Arrows cert level 0 (col_arrow_cert0)
+                 0xd0, 0x40, 0x20,  # Arrows cert level 1 (col_arrow_cert1)
+                 0x00, 0x90, 0x90,  # Arrows cert level 2 (col_arrow_cert2)
+                 0x10, 0xe0, 0x20,  # Arrows cert level 3 (col_arrow_cert3)
+                 0xf0, 0xff, 0xf0,  # Added Arrows        (col_arrow_added)
+                 0x00, 0x00, 0x00,  # Arrow borders       (col_arrowb)
+                 #0x00, 0x10, 0x70,  # Arrow borders       (col_arrowb)
+                 0xff, 0x00, 0x00,  # Box borders         (col_boxb)
+                 0x00, 0x00, 0x00,  # Logo background     (~col_logbs)
+                 0xff, 0xff, 0xff]  # Logo foreground     (~col_logfs)
+    }
+(col_bg, col_boxi, col_font, col_line, col_arrow_cert0,
+ col_arrow_cert1, col_arrow_cert2, col_arrow_cert3, 
+ col_arrow_added, col_arrowb, col_boxb) = range(11)
+col_logbs, col_logfs = "\x0b", "\x0c"
+import sys
+import os
+import string
+import struct
+import math
+import re
+import random
+
+# How cert levels are presented
+clascii = "abcd0123?!U"
+# We need symbolic names for some of them.
+CL_unknown = clascii.index("?")
+CL_added   = clascii.index("!")
+CL_unilink = clascii.index("U")
+
+
+class wotError(Exception):
+    """Base class for exceptions in this module."""
+    def __str__(self):
+        return self.__unicode__().encode("UTF-8", "replace")
+    def __unicode__(self):
+        return u"wotError: unknown error"
+class wotKeyNotFoundError(wotError):
+    """Exception raised when a key is not found.
+    Attributes:
+        key -- The key that could not be found
+    """
+    def __init__(self, key):
+        self.key = key
+    def __unicode__(self):
+        return u'Key not found: "%s"' % self.key
+class wotLoadFileError(wotError):
+    """Exception raised when loading a .wot file failed.
+    Attributes:
+        msg -- Message describing the error
+    """
+    def __init__(self, msg):
+        self.msg = msg
+    def __unicode__(self):
+        return self.msg
+class wotModstringError(wotError):
+    """Exception raised when a modstring contains errors
+    Attributes:
+        msg -- Message describing the error
+    """
+    def __init__(self, msg):
+        self.msg = msg
+    def __unicode__(self):
+        return self.msg
+class wotTimeoutError(wotError):
+    """Exception raised when something takes too long time
+    Class attributes:
+        errorstring   -- Default error string
+    Object attributes:
+        times = {
+          'percentdone'         -- How many percent were completed?,
+          'timeelapsed'         -- How many seconds did it take?,
+          'calculatedtime'      -- Calculated total time,
+          'calculatedtimeleft'  -- Calculated time to complete,
+          'appendstring'        -- String to append to message
+                }
+    """
+    errorstring = u"Just %(percentdone)d%% processed in %(timeelapsed).2f " \
+                   "seconds. With this speed, completing would \n" \
+                   "take %(calculatedtimeleft).1f seconds more, " \
+                   "totally %(calculatedtime).1f seconds.\n" \
+                   "%(appendstring)s"
+    def __init__(self, times=None):
+        self.times = times
+    def __unicode__(self):
+        return self.errorstring % self.times
+class wotTooManyError(wotError):
+    """Exception raised when there are too many matches.
+    Attributes:
+        nmatches = number of matches
+    """
+    def __init__(self, nmatches=None):
+        self.nmatches = nmatches
+    def __unicode__(self):
+        return 'Sorry, too many matches: %d. Try a more restricted search.' % \
+               self.nmatches
+
+init_pil_get_logo_logo = None
+
+def init_pil_get_logo():
+    global init_pil_get_logo_logo
+    if init_pil_get_logo_logo is not None:
+        return init_pil_get_logo_logo
+
+    try:
+        global Image, ImageDraw, ImageFont
+        import Image, ImageDraw, ImageFont
+    except ImportError:
+        print >>sys.stderr, \
+              "wotsap: Unable to import Python Imaging Library modules\n" \
+              "        (Image, ImageDraw, ImageFont)\n" \
+              "They can be downloaded from:\n" \
+              "        http://www.pythonware.com/products/pil/"
+        raise
+
+    packedlogo=[\
+    528,1,6,1,3,1,13,1,2,1,27,1,17,1,15,1,1,1,21,1,7,1,8,1,15,1,20,1,6,1,6,1,
+    3,1,13,1,2,1,27,1,17,1,15,1,23,1,16,1,15,1,20,1,6,1,1,2,2,3,1,3,1,1,1,2,3,
+    1,2,1,2,1,1,1,2,1,2,1,1,1,2,1,2,1,1,1,2,1,2,1,4,1,1,1,2,1,2,2,2,3,2,3,2,3,
+    2,1,1,1,4,1,1,1,1,1,2,1,5,2,3,2,3,1,8,1,2,2,3,1,1,1,2,1,2,1,2,3,2,3,2,2,2,
+    3,2,1,1,2,3,1,7,2,2,1,2,1,3,1,2,2,2,1,5,1,2,1,1,1,2,1,2,1,1,1,2,1,2,1,1,1,
+    2,1,2,1,4,1,1,1,2,1,1,1,2,1,4,1,2,1,2,1,3,1,1,2,5,1,1,1,1,1,2,1,4,1,2,1,1,
+    1,2,1,2,1,2,2,2,1,1,1,1,1,2,1,2,1,1,1,2,1,2,1,1,1,3,1,2,1,2,1,2,1,4,1,1,2,
+    2,1,2,1,7,1,3,1,2,1,3,1,2,1,3,1,5,1,2,1,2,1,1,1,1,1,3,1,1,1,1,1,3,1,1,1,1,
+    1,5,1,1,1,1,1,3,2,3,3,2,1,2,1,3,1,1,1,6,1,1,1,1,1,2,1,5,2,2,4,2,1,1,1,2,2,
+    2,1,1,1,5,1,2,1,1,1,1,1,2,1,3,1,2,1,3,2,3,3,1,1,3,1,2,1,7,1,3,1,2,1,3,1,2,
+    1,3,1,5,1,2,1,2,1,1,1,1,1,3,1,1,1,1,1,3,1,1,1,1,1,5,1,1,1,1,1,5,1,1,1,2,1,
+    2,1,2,1,3,1,1,1,6,1,1,1,1,1,2,1,7,1,1,1,5,1,8,1,1,1,5,1,2,1,1,1,1,1,2,1,3,
+    1,2,1,5,1,1,1,2,1,1,1,3,1,2,1,7,1,3,1,2,1,3,1,2,2,2,1,4,1,2,1,4,1,1,1,5,1,
+    1,1,5,1,1,1,6,1,2,2,2,1,2,1,1,1,2,1,2,1,2,1,3,1,1,1,6,1,1,1,1,1,2,1,4,1,2,
+    1,1,1,2,1,1,1,9,1,1,1,2,1,1,1,4,1,1,1,3,1,3,1,2,1,2,1,2,1,1,1,2,1,1,2,2,1,
+    1,1,8,1,3,1,2,2,2,2,1,1,1,2,3,1,1,1,2,1,4,1,1,1,5,1,1,1,5,1,1,1,4,1,1,1,2,
+    1,4,2,3,2,1,1,1,2,2,3,2,1,4,1,1,1,1,1,2,3,2,1,2,2,3,2,2,1,9,1,2,2,2,1,4,1,
+    1,1,4,3,3,2,2,2,3,2,1,2,1,2,2,1,22,1,44,1,60,1,1,1,37,1,28,1,43,1,62,1,38,
+    1,361]
+
+    logostr = []
+    curcol, othercol = col_logbs, col_logfs
+    for x in packedlogo:
+        logostr.append(curcol*x)
+        curcol, othercol = othercol, curcol
+
+    init_pil_get_logo_logo = \
+                  Image.fromstring('P', (175,15), string.join(logostr, ""))
+    return init_pil_get_logo_logo
+
+
+# Created using gunzip, pilfont.py, pngcrush and base64-encode on
+# /usr/X11R6/lib/X11/fonts/75dpi/courR14-ISO8859-1.pcf.gz from Debian
+# package xfonts-75dpi.
+_fontstr = ('''
+UElMZm9udAo7Ozs7OzsxMzsKREFUQQoACQAAAAD/9wAHAAAAAAAAAAcACQAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAkAAAAA//8AAQAAAAcAAAAIAAEACQAAAAP/9gAEAAAACAAAAAkA
+CgAJAAAAAv/3AAb/+wAJAAAADQAEAAkAAAAC//cABwAAAA0AAAASAAkACQAAAAL/9QAHAAIA
+EgAAABcADQAJAAAAAf/2AAgAAAAXAAAAHgAKAAkAAAAB//gABwAAAB4AAAAkAAgACQAAAAP/
+9wAE//sAJAAAACUABAAJAAAAA//2AAYAAgAlAAAAKAAMAAkAAAAC//YABQACACgAAAArAAwA
+CQAAAAH/9wAG//0AKwAAADAABgAJAAAAAf/4AAj//wAwAAAANwAHAAkAAAAC//4ABQACADcA
+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
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJAAAAAP//AAEAAAJUAAAC
+VQABAAkAAAAE//kABQACAlUAAAJWAAkACQAAAAL/9wAHAAACVgAAAlsACQAJAAAAAf/3AAgA
+AAJbAAACYgAJAAkAAAAB//kAB///AmIAAAJoAAYACQAAAAH/9wAIAAACaAAAAm8ACQAJAAAA
+BP/3AAUAAgJvAAACcAALAAkAAAAB//cABwABAnAAAAJ2AAoACQAAAAL/9wAH//gCdgAAAnsA
+AQAJAAAAAP/3AAgAAAJ7AAACgwAJAAkAAAAC//cABv/9AoMAAAKHAAYACQAAAAD/+QAIAAAC
+hwAAAo8ABwAJAAAAAf/6AAj//QKPAAAClgADAAkAAAAB//sAB//8ApYAAAKcAAEACQAAAAD/
+9wAIAAACnAAAAqQACQAJAAAAAv/4AAb/+QKkAAACqAABAAkAAAAC//YABv/6AqgAAAKsAAQA
+CQAAAAH/+AAI//8CrAAAArMABwAJAAAAAv/2AAb//AKzAAACtwAGAAkAAAAC//YABv/8ArcA
+AAK7AAYACQAAAAL/9gAG//gCuwAAAr8AAgAJAAAAAP/5AAgAAwK/AAACxwAKAAkAAAAB//cA
+CAABAscAAALOAAoACQAAAAP/+wAF//0CzgAAAtAAAgAJAAAAAgAAAAUAAwLQAAAC0wADAAkA
+AAAD//YABv/8AtMAAALWAAYACQAAAAL/9wAG//0C1gAAAtoABgAJAAAAAP/5AAgAAALaAAAC
+4gAHAAkAAP////YACQABAuIAAALsAAsACQAA////9gAJAAEC7AAAAvYACwAJAAD////2AAkA
+AQL2AAADAAALAAkAAAAC//kABwACAwAAAAMFAAkACQAAAAD/9AAJAAADBQAAAw4ADAAJAAAA
+AP/0AAkAAAMOAAADFwAMAAkAAAAA//QACQAAAxcAAAMgAAwACQAAAAD/9AAJAAAAAAANAAkA
+GQAJAAAAAP/1AAkAAAAJAA0AEgAYAAkAAAAA//MACQAAABIADQAbABoACQAA////9wAIAAAA
+GwANACQAFgAJAAAAAf/3AAgAAwAkAA0AKwAZAAkAAAAB//QACAAAACsADQAyABkACQAAAAH/
+9AAIAAAAMgANADkAGQAJAAAAAf/0AAgAAAA5AA0AQAAZAAkAAAAB//UACAAAAEAADQBHABgA
+CQAAAAL/9AAHAAAARwANAEwAGQAJAAAAAv/0AAcAAABMAA0AUQAZAAkAAAAC//QABwAAAFEA
+DQBWABkACQAAAAL/9QAHAAAAVgANAFsAGAAJAAAAAP/3AAgAAABbAA0AYwAWAAkAAAAA//QA
+CAAAAGMADQBrABkACQAAAAD/9AAIAAAAawANAHMAGQAJAAAAAP/0AAgAAABzAA0AewAZAAkA
+AAAA//QACAAAAHsADQCDABkACQAAAAD/9AAIAAAAgwANAIsAGQAJAAAAAP/1AAgAAACLAA0A
+kwAYAAkAAAAB//gACP//AJMADQCaABQACQAA////9wAIAAAAmgANAKMAFgAJAAAAAP/0AAgA
+AACjAA0AqwAZAAkAAAAA//QACAAAAKsADQCzABkACQAAAAD/9AAIAAAAswANALsAGQAJAAAA
+AP/1AAgAAAC7AA0AwwAYAAkAAAAB//QACAAAAMMADQDKABkACQAAAAH/9wAIAAAAygANANEA
+FgAJAAAAAf/2AAgAAADRAA0A2AAXAAkAAAAB//YACAAAANgADQDfABcACQAAAAH/9gAIAAAA
+3wANAOYAFwAJAAAAAf/2AAgAAADmAA0A7QAXAAkAAAAB//YACAAAAO0ADQD0ABcACQAAAAH/
+9wAIAAAA9AANAPsAFgAJAAAAAf/1AAgAAAD7AA0BAgAYAAkAAAAA//kACAAAAQIADQEKABQA
+CQAAAAH/+QAIAAMBCgANAREAFwAJAAAAAf/2AAgAAAERAA0BGAAXAAkAAAAB//YACAAAARgA
+DQEfABcACQAAAAH/9gAIAAABHwANASYAFwAJAAAAAf/3AAgAAAEmAA0BLQAWAAkAAAAC//YA
+BwAAAS0ADQEyABcACQAAAAL/9gAHAAABMgANATcAFwAJAAAAAv/2AAcAAAE3AA0BPAAXAAkA
+AAAC//cABwAAATwADQFBABYACQAAAAD/9QAIAAABQQANAUkAGAAJAAAAAP/2AAgAAAFJAA0B
+UQAXAAkAAAAA//YACAAAAVEADQFZABcACQAAAAD/9gAIAAABWQANAWEAFwAJAAAAAP/2AAgA
+AAFhAA0BaQAXAAkAAAAA//YACAAAAWkADQFxABcACQAAAAD/9wAIAAABcQANAXkAFgAJAAAA
+AP/4AAj//wF5AA0BgQAUAAkAAAAA//kACAAAAYEADQGJABQACQAAAAD/9gAIAAABiQANAZEA
+FwAJAAAAAP/2AAgAAAGRAA0BmQAXAAkAAAAA//YACAAAAZkADQGhABcACQAAAAD/9wAIAAAB
+oQANAakAFgAJAAAAAP/2AAgAAwGpAA0BsQAaAAkAAAAA//cACAADAbEADQG5ABkACQAAAAD/
+9wAIAAMBuQANAcEAGQ==
+''', '''
+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
+fwHwwTn7qlsWNAAAAABJRU5ErkJggg==
+''')
+
+
+# Terminology: Given key X, up (UP) in the web is the keys that
+# are signed by X. Down (DN) is the keys that has signed X. To find
+# the keys you might trust, you search up from your key. To find
+# out who might trust you, you search down from your key.
+UP, DN = range(2)
+
+def loadfile(wotfilename):
+    """Load file as specified by
+    http://www.lysator.liu.se/~jc/wotsap/wotfileformat.txt"""
+    def error(str):
+        raise wotLoadFileError, str
+
+    try:
+        f = open(wotfilename)
+    except IOError, (errno, strerror):
+        error(u'Unable to open file "%s": %s' % (wotfilename, strerror))
+
+    header = "!<arch>\n"
+    try:
+        s = f.read(len(header))
+    except IOError, (errno, strerror):
+        error(u'Unable to read from file "%s": %s' % (wotfilename, strerror))
+
+    if s != header:
+        f = os.popen('bunzip2 < "%s"' % wotfilename)
+        s = f.read(len(header))
+        if s != header:
+            error(u"%s does not look like a .wot file." % wotfilename)
+
+    sigs=names=keys=0
+    debug=readme=None
+    while 1:
+        filename = f.read(16)
+        if len(filename) == 0:
+            break
+        mtime, uid, gid, mode, size, trailer = \
+               int(f.read(12)), int(f.read(6)), int(f.read(6)), \
+               int(f.read(8)), int(f.read(10)), f.read(2)
+        if trailer != '`\n':
+            error(u"Corrupt WOT file, trailer not found.")
+        filename = filename.split('/')[0]
+
+        if filename == "README":
+            readme = unicode(f.read(size), 'utf-8', errors='replace')
+            if size & 1:
+                f.read(1)
+        elif filename == "debug":
+            debug = unicode(f.read(size), 'utf-8', errors='replace')
+            if size & 1:
+                f.read(1)
+        elif filename == "names":
+            names = unicode(f.read(size), 'utf-8', errors='replace') \
+                       .split('\n')
+            if size & 1:
+                f.read(1)
+            # If the last name has a newline (as it should have):
+            if names[-1] == "":
+                del names[-1]
+        elif filename == "keys":
+            keys = []
+            for n in xrange(size//4):
+                keys.append(struct.unpack('!i', f.read(4))[0])
+        elif filename == "WOTVERSION":
+            version = f.read(size)
+            if size & 1:
+                f.read(1)
+            if   version == "0.1\n" or version[:4] == "0.1.":
+                version = "0.1"
+            elif version == "0.2\n" or version[:4] == "0.2.":
+                version = "0.2"
+            else:
+                error(u"Unknown WOT file version %s" % version)
+        elif filename == "signatures":
+            if version == "0.1":
+                current = {}
+                sigs = [current]
+                for n in xrange(size//4):
+                    key = struct.unpack('!i', f.read(4))[0]
+                    if key != -1:
+                        current[key] = CL_unknown # Unknown cert check level
+                    else:
+                        current = {}
+                        sigs.append(current)
+            else:
+                sigs = []
+                for x in keys:
+                    current = {}
+                    num = struct.unpack('!i', f.read(4))[0]
+                    for y in struct.unpack('!'+'i'*num, f.read(4*num)):
+                        current[y & 0x0fffffff] = y>>28
+                    sigs.append(current)
+        else:
+            print >>sys.stderr, "Strange. Found %s file." % filename
+            f.seek(size + (size&1), 1)
+    f.close()
+    if not (len(names) == len(keys) == len(sigs)):
+        error(u"Corrupt WOT file: Number of keys/names/sigs does not match: %d/%d/%d"\
+              % (len(keys), len(names), len(sigs)))
+    return names, keys, sigs, readme, wotfilename, version, debug
+
+def reversesigs(sigs):
+    """Reverse signatures. (s/signs/signed by/)
+    Assumes the reversed set is of equal size <=> the set is a strongly
+    connected set."""
+
+    revsigs = [ {} for x in sigs ]
+    for n in xrange(len(sigs)):
+        for key in sigs[n]:
+            revsigs[key][n] = sigs[n][key]
+    return revsigs
+
+# OK, this has some special cases, to make it faster. This is probably
+# the only function that needs to be really fast.
+# If mod is set, we also need dir == UP or DN.
+def findnext(keys, web, forbiddenkeys=None, mod=None, dir=None, getconns=1):
+    """Return a dictionary containing keys and a set of keys link to."""
+    connections = {}
+
+    modsigs = mod and (mod.exclsigs or mod.excllvls or mod.exclunlk)
+    if mod and mod.exclkeys: modexcl = mod.exclkeys
+    else:                    modexcl = []
+    if not forbiddenkeys:    forbiddenkeys = []
+
+    # Why, you ask, why do we keep both forbiddenkeys and mod.excllvls
+    # instead of joining them to one dictionary? Well, I made some
+    # tests, and this method is ~ 40% faster. Copying a dictionary is
+    # expensive.
+
+    if getconns:
+      if not modsigs:
+        for x in keys:
+            for y in web[x]:
+                if y not in forbiddenkeys and y not in modexcl:
+                    if y not in connections:
+                        connections[y] = {}
+                    connections[y][x] = web[x][y]
+      else:
+        for x in keys:
+            for y in web[x]:
+                # There might be confusion about modstrings excluding
+                # levels here. Are they up or down? As it turns out,
+                # there is no need to worry. It is up to the caller to
+                # provide a correct web, with correct signature
+                # levels.
+                if     y not in forbiddenkeys and y not in modexcl            and \
+                       ((not mod.exclunlk)  or x     in mod.wot.sigs[dir][y]) and \
+                      (x,y)     not in mod.exclsigs  and \
+                      web[x][y] not in mod.excllvls:
+                    if y not in connections:
+                        connections[y] = {}
+                    connections[y][x] = web[x][y]
+    else:
+      if not modsigs:
+        for x in keys: # Here we add even forbidden keys.
+            connections.update(web[x])
+      else:
+        for x in keys:
+            for y in web[x]:
+                if     y not in forbiddenkeys and y not in mod.exclkeys       and \
+                       ((not mod.exclunlk)  or x     in mod.wot.sigs[dir][y]) and \
+                      (x,y)     not in mod.exclsigs  and \
+                      web[x][y] not in mod.excllvls:
+                    connections[y] = None
+    # And here we remove them.
+    if (not getconns) and (not modsigs):
+        if len(connections) > len(forbiddenkeys) + len(modexcl):
+            for x in forbiddenkeys:
+                if x in connections:
+                    del connections[x]
+            for x in modexcl:
+                if x in connections:
+                    del connections[x]
+        else:
+            conn,connections = connections, {}
+            for x in conn:
+                if x not in forbiddenkeys and x not in modexcl:
+                    connections[x] = None
+
+    # Included sigs have precedence over excluded sigs/keys.
+    if mod and mod.add_sigs:
+        for x,y in mod.add_sigs:
+            if dir == DN:
+                x,y = y,x
+            if x in keys and y is not None and y not in forbiddenkeys:
+                if getconns:
+                    if y not in connections:
+                        connections[y] = {}
+                    connections[y][x] = CL_added
+                else:
+                    connections[y] = None
+    return connections
+
+# To compare speed with findnext().
+def __findnext_nomod(keys, web, forbiddenkeys=None):
+    "Test function"
+    connections = {}
+    for x in keys:
+        for y in web[x]:
+            if (not forbiddenkeys) or y not in forbiddenkeys:
+                if y not in connections:
+                    connections[y] = {}
+                connections[y][x] = web[x][y]
+    return connections
+
+# To compare speed with findnext().
+def __findnext_nomod_nogetconns(keys, web, forbiddenkeys=None):
+    "Test function"
+    conn0,conn1 = {}, {}
+    for x in keys:
+        conn0.update(web[x])
+    for x in conn0:
+        if x not in forbiddenkeys:
+            conn1[x] = None
+    return conn1
+            
+
+def findpaths(wot, bottom, top, mod):
+    """Find all paths in wot from bottom to top"""
+    if bottom == top:
+        return [{bottom: None}]
+    seen = {bottom: None}
+    conn = [{bottom: None}]
+    for lev in xrange(500):
+        conn.append(findnext(conn[lev], wot.sigs[UP], seen, mod, UP))
+        if top in conn[-1]:
+            # We got a match, but we also have lots of unneeded
+            # connections to irrelevant keys. We must trim down the
+            # web to just those paths leading to top. We do this by
+            # reversing the web and going from top to bottom, using
+            # this web. Since the modstring is already coded into the
+            # web, we need not use it again.
+            ret = [{top: None}]
+            conn.reverse()
+            conn.pop()
+            for w in conn:
+                ret.append( findnext(ret[-1], w))
+            return ret
+        if len(conn[-1]) == 0:
+            return None
+        seen.update(conn[-1])
+    return None
+
+# This function is actually slightly slower than the real msd() now.
+def __msd_standalone(wot, key):
+    """Test function."""
+
+    seen = {key: None}
+    lastlevel = {key: None}
+    total = 0
+    for lev in xrange(100):
+        total += lev * len(lastlevel)
+        thislevel = {}
+        for x in lastlevel:
+            thislevel.update(wot.sigs[DN][x])
+        lastlevel = {}
+        for x in thislevel:
+            if x not in seen:
+                lastlevel[x] = None
+        seen.update(lastlevel)
+        if not lastlevel:
+            break
+    return total / len(seen)
+
+def msd(wot, key, mod=None, forbiddenkeys=None):
+    """Quite fast msd checker, but not fast enough to calculate all msds at
+    startup."""
+    if mod:
+        mod = Mod(wot, mod)
+
+    lastlevel = {key: None}
+    seen      = {key: None}
+    forbiddenkeys = forbiddenkeys or {}
+    seen.update(forbiddenkeys)
+    total = 0
+    for lev in xrange(100):
+        total += lev*len(lastlevel)
+        thislevel = findnext(lastlevel, wot.sigs[DN], seen, mod, DN, 0)
+        if len(thislevel) == 0:
+            break
+        seen.update(thislevel)
+        lastlevel = thislevel
+    # The MSD returned is calculated from the group that can reach
+    # this key. If there exists keys that cannot reach this key, the
+    # MSD for the key in the larger group is, in some sense, infinite.
+    numofseen = len(seen)-len(forbiddenkeys)
+    return total / numofseen, total, numofseen
+
+def str2key(key):
+    """Transforms a key given as string to integer"""
+    if key[0:2] == "0x":
+        key = key[2:]
+    key = long(key, 16)
+    if key >= 2**31:
+        key -= 2**32
+    return int(key)
+
+def key2str(key):
+    """Transforms a key given as integer to string"""
+    if key<0:
+        key = key+2**32
+    key = string.zfill(hex(key)[2:], 8).upper()
+    if key[-1] == "L":
+        key = key[:-1]
+    return key
+
+def fullkey(wot, key, certlvl=None, alt=None):
+    """Transform key to string with both keyID and name"""
+    c = u""
+    if certlvl is not None:
+        c = u"%s " % clascii[certlvl]
+    if key is not None:
+        return u"%s0x%s %s" % (c, key2str(wot.keys[key]), wot.names[key])
+    else:
+        if alt is not None:
+            return u'[Key %s not found]' % alt
+        else:
+            return u'[Key not found]'
+
+def bettersign(wot, key, numberofkeystoremember=10, interestingkeys=(),
+               mod=None, timer=None):
+    """Search for keys which signature should minimize distance."""
+    included    = {key: None}
+    conn        = {key: None}
+    total       = 0
+
+    if not numberofkeystoremember:
+        return []
+
+    keydistance = [ None for x in wot.keys ]
+    for lev in xrange(100):
+        for x in conn:
+            keydistance [x] = lev
+        total += lev * len(conn)
+        conn = findnext(conn, wot.sigs[DN], included, mod, DN, 0)
+        if not conn:
+            break
+        included.update(conn)
+
+    if timer:
+        import time
+        totaltime = timer.get('time', 5)
+        fraction  = timer.get('fraction', 0.50)
+        action    = timer.get('action', 'raise')
+        begintime = time.time()
+        deadline  = begintime + totaltime*fraction
+
+    minimum = [(total,None) for x in xrange(numberofkeystoremember)]
+    processedkeys = -1
+    for actualkey in interestingkeys:
+        processedkeys += 1
+        if timer and time.time() >= deadline:
+            fractionprocessed = processedkeys/len(interestingkeys)
+            elapsedtime = time.time() - begintime
+            if fractionprocessed < fraction:
+                times = {'percentdone'        : fractionprocessed*100,
+                         'timeelapsed'        : elapsedtime,
+                         'calculatedtime'     : elapsedtime/fractionprocessed,
+                         'calculatedtimeleft' : elapsedtime/fractionprocessed - elapsedtime,
+                         'appendstring':
+                           "Looking for most wanted signatures very costly; You may want to simply look at \n"
+                           "http://keyserver.kjsl.com/~jharris/ka/current/top50table.html instead.\n"
+                           "Or restrict the wanted signatures.\n"
+                           "Proceding anyway, but this might take a while.\n"
+                         }
+                if action == 'raise':
+                    raise wotTimeoutError(times)
+                elif action == 'stderr':
+                    print >>sys.stderr, wotTimeoutError(times)
+                    timer = None
+        if actualkey not in included:
+            continue # Filtered out by modstring
+        actualsum = total
+        seen      = {actualkey: None, key: None}
+        conn      = {actualkey: None}
+        for lev in xrange(1,100):
+            modified  = {}
+            for x in conn:
+                if keydistance[x] > lev:
+                    actualsum += lev - keydistance[x]
+                    modified[x] = None
+            if not modified:
+                break
+            conn = findnext(modified, wot.sigs[DN], seen, mod, DN, 0)
+            seen.update(conn)
+        #print float(actualsum) / len(wot.keys), key2str(wot.keys[actualkey])
+        if actualsum < minimum[-1][0]:
+            for x in xrange(len(minimum)):
+                if actualsum < minimum[x][0]:
+                    break
+            minimum[x:]=[(actualsum, actualkey)] + minimum[x:-1]
+    for i in xrange(numberofkeystoremember):
+        if minimum[i][1] is None:
+            break
+    return minimum[:i]
+
+def keystats(wot, key, mod=None, wanted=0, restrict=None, timer=None):
+    """Statistics for a key"""
+
+    seen = {key: None}
+    conn = {key: None}
+    total = totalweighted = 0
+    header = u"Statistics for key %s\n" % fullkey(wot, key)
+
+    if mod:
+        header += u"\n"
+        header += u"These modifications of the web of trust were used:\n"
+        header += unicode(mod)
+        
+    downtrace = \
+     u"Tracing downwards from this key. Keys in level 1 have signed this\n"\
+      "key, keys in level (n) have signed at least one key in level (n-1).\n\n"
+    smalllevels = "Levels with 10 keys or less:\n"
+    for lev in xrange(100):
+        if len(conn) <= 10:
+            smalllevels += u"  Level %2d:\n" % lev
+            for x in conn:
+                smalllevels += u"    %s\n" % fullkey(wot, x)
+        total += len(conn)
+        totalweighted += lev * len(conn)
+        downtrace += u"Keys in level %2d: %6d\n" % (lev, len(conn))
+        conn = findnext(conn, wot.sigs[DN], seen, mod, DN)
+        if not conn:
+            break
+        seen.update(conn)
+    downtrace += u"Total number of keys in strong set: %6d\n" % len(wot.keys)
+
+    msds  = u"Mean shortest distance:                  %2.4f\n" % \
+           (totalweighted / total)
+    if mod:
+        msds += u"From number of keys:                %6d\n" % total
+        msds += u" (MSD is %2.4f from %6d keys without modstring.)" % \
+               (msd(wot, key)[0], len(wot.keys))
+    want = u''
+    if wanted:
+        interestingkeys = nametokey(wot, restrict, getall=1)
+        best  = bettersign(wot, key, wanted, interestingkeys, mod, timer)
+        want += u"Most wanted signatures"
+        if restrict:
+            want += " from the %d keys matching '%s'" % \
+                    (len(interestingkeys), restrict)
+        want += u": \n"
+        for x in best:
+            if x[1] is not None:
+                want += u"MSD=%2.4f if signed by %s\n" % \
+                        (x[0]/total,fullkey(wot,x[1]))
+        if best:
+            want += u"MSD=%2.4f right now.\n" % (totalweighted/total)
+        else:
+            want += u"No wanted signatures found.\n"
+        
+    footer = u"Other report for this key are available:\n" \
+             u"  http://keyserver.kjsl.com/~jharris/ka/current/%s/%s\n" \
+             u"  http://thomas.butter.dk/gpg/getmsd.php?key=%s\n" \
+             u"  http://www.cs.uu.nl/~henkp/henkp/pgp/pathfinder/mk_path.cgi?FROM=%s&STATS=statistics\n" %\
+             (key2str(wot.keys[key]).upper()[:2],\
+              key2str(wot.keys[key]).upper()    ,\
+              key2str(wot.keys[key]).upper()    ,\
+              key2str(wot.keys[key]).upper())
+    sup = wot.sigs[UP][key]
+    sdn = wot.sigs[DN][key]
+    sigs_up = [(x, "-,%s" % clascii[sup[x]])                  for x in sup if x not in sdn]
+    sigs_cr = [(x, "%s,%s"%(clascii[sdn[x]],clascii[sup[x]])) for x in sup if x     in sdn]
+    sigs_dn = [(x, "%s,-" % clascii[sdn[x]])                  for x in sdn if x not in sup]
+
+    n, a = len(sdn), (wot.numofsigs / len(wot.keys))
+    if mod: ups = u"Modstring is not used below this point.\n\n"
+    else:   ups = u""
+
+    ups += u"This key is signed by %d key%s, which is " %(n, n!=1 and "s" or "")
+    if n > a:
+        ups += u"more than"
+    elif n==a:
+        ups += u"equal to"
+    else:
+        ups += u"less than"
+    ups += u" the average %2.4f.\n" % a
+    ups += u"This key has signed %d key%s.\n\n" % \
+           (len(sup), len(sup)!=1 and "s" or "")
+    ups += u"Below, the numbers p,q before the keys are the cert check levels %s-%s,\n" \
+           % (clascii[4], clascii[7])
+    ups += u"or %s-%s if the primary UID is not signed. p is for the signature on the key \n" \
+           % (clascii[0], clascii[3])
+    ups += u"this report is about, and q is for the signature on the key to the right.\n\n"
+
+    for x in [(sigs_dn, u"This key is signed by, excluding cross-signatures:"),
+              (sigs_cr, u"This key is cross-signed with:"),
+              (sigs_up, u"Keys signed by this key, excluding cross-signatures:")]:
+        ups += x[1] + u"\n"
+        for y in x[0]:
+            ups += u" %s %s\n" % (y[1], fullkey(wot, y[0]))
+        ups+=u"Total: %d key%s.\n\n" % (len(x[0]), len(x[0])!=1 and u"s" or u"")
+
+    return header+'\n'+downtrace+'\n'+msds+'\n'+smalllevels+'\n'+want+'\n'+ups+'\n'+footer
+    
+
+(pos_top, pos_middle, pos_bottom) = (-0.5, 0, 0.5)
+def yposition(pos, numlevels, where, boxh, height):
+    return boxh/2+(pos+0.5)*(height-boxh)/numlevels + where*boxh
+
+# To create anything other than PNG, like SVG or text, these two are
+# the functions to change.
+def drawline(draw, x0, y0, x1, y1, config, certlevel=CL_unknown):
+    """Draw an arrow in a PIL object"""
+
+    if certlevel in (0,4,CL_unknown):
+        wide = 0
+    else:
+        wide = 1
+
+    if   0 <= certlevel < 4:
+        dashed = 1
+        color = col_arrow_cert0 + certlevel
+    elif 4 <= certlevel < 8:
+        dashed = 0
+        color = col_arrow_cert0 + certlevel - 4
+    elif certlevel == CL_unknown:  # Thin red arrow
+        dashed = 0
+        color = col_arrow_cert0 + 1
+    elif certlevel == CL_added:
+        dashed = 0
+        color = col_arrow_added
+    else:
+        raise AssertionError
+
+    # Calculate line coordinates.
+    x=x1-x0
+    y=y1-y0
+    length = math.sqrt(x**2 + y**2)
+    if wide:
+        # Shorten top and lower bottom so edges don't go outside arrow
+        # heads and boxes. (But bottom is already low enough.)
+        harrowlen = config["arrowlen"] / 2
+        xend = x1 - harrowlen*x/length
+        yend = y1 - harrowlen*y/length
+        disx = -1
+        disy = 0
+        if x>0: disy = -1
+        if x<0: disy =  1
+        p0x,p0y = (x0  -disx, y0  -disy)
+        p1x,p1y = (xend-disx, yend-disy)
+        p2x,p2y = (xend+disx, yend+disy)
+        p3x,p3y = (x0  +disx, y0  +disy)
+
+    if not dashed:  # Signature on primary UID
+        if not wide:
+            draw.line( [x0, y0, x1, y1], fill=color)
+        else:
+            draw.polygon( [ (p0x,p0y), (p1x,p1y), (p2x,p2y), (p3x,p3y) ],
+                          outline=col_arrowb, fill=color)
+    else: # Why doesn't PIL have a function for drawing dashed lines?
+        dl = 5
+        dx = (x*dl)/length
+        dy = (y*dl)/length
+        if not wide:
+            l = 0
+            while l < length:
+                draw.line( [x0, y0, x0+dx, y0+dy], fill=color)
+                x0 += 2*dx
+                y0 += 2*dy
+                l  += 2*dl
+        else:
+            stop = math.sqrt((p0x-p1x)**2 + (p0y-p1y)**2)
+            l = 0
+            while l < stop:
+                draw.polygon( [(p0x   ,p0y   ), (p3x   ,p3y   ),
+                               (p3x+dx,p3y+dy), (p0x+dx,p0y+dy)],
+                              outline=col_arrowb, fill=color)
+                p0x += 2*dx
+                p3x += 2*dx
+                p0y += 2*dy
+                p3y += 2*dy
+                l   += 2*dl
+                             
+        
+    a = config["arrowang"] * 2*math.pi / 360
+    s = config["arrowlen"] / length
+    # Rotation and scaling matrix:
+    rotm = [ math.cos(a)*s, math.sin(a)*s,
+            -math.sin(a)*s, math.cos(a)*s]
+    rot0 = (-rotm[0]*x-rotm[1]*y , -rotm[2]*x-rotm[3]*y)
+    rot1 = (-rotm[0]*x+rotm[1]*y , +rotm[2]*x-rotm[3]*y)
+    draw.polygon( [ (x1        , y1        ),
+                    (x1+rot0[0], y1+rot0[1]),
+                    (x1+rot1[0], y1+rot1[1])],
+                  outline=col_arrowb, fill=color)
+
+def drawnode(draw, x, y, w, h, key, wot):
+    """Draw a node (key) in a PIL object."""
+    draw.rectangle( (x,y,x+w,y+h), fill=col_boxi, outline=col_boxb)
+    border = 2
+    x += border
+    y += border
+    w -= border*2
+    if w<0:
+        w=0
+    h -= border*2
+    # What charset should we use? It depends on font, of course.
+    keystr = key2str(wot.keys[key])
+    name = wot.names[key].encode('iso-8859-15', 'replace')
+    lines = (keystr + '\n' + name.replace('<', '\n<')).split('\n', 2)
+    sizes = []
+    totalheight = 0
+    for l in xrange(len(lines)):
+        lines[l] = lines[l].strip()
+        while wot.font.getsize(lines[l])[0] > w:
+            lines[l] = lines[l][:-1]
+        sizes.append(wot.font.getsize(lines[l]))
+        totalheight += sizes[-1][1]
+    
+    yoffset = (h - totalheight) / 2
+    for l in xrange(len(lines)):
+        xoffset  = (w - sizes[l][0])/2
+        draw.text((x+xoffset, y+yoffset), lines[l],
+                  font=wot.font, fill=col_font)
+        yoffset += sizes[l][1]
+
+def create_pil(web, keys, config, wot):
+    """Create a PIL object with a graph of a web."""
+
+    logo = init_pil_get_logo()
+
+    conf = defaultconfig.copy()
+    if config:
+        conf.update(config)
+
+    size  = conf["size"]
+    boxh  = wot.font.getsize('Al9F_-/\<>@"')[1] * 3.5
+    im    = Image.new('P', size);
+    palette = [ 0 for x in xrange(768) ]
+    palette[0:len(defaultconfig["colors"])] = defaultconfig["colors"]
+    if config and config.has_key("colors"):
+        palette[0:len(   config["colors"])] =        config["colors"]
+    im.putpalette(palette)
+    draw = ImageDraw.Draw(im)
+    levels = len(web)
+    # Calculate widths. Proportional to
+    # number_of_links_up*number_of_links_down
+    widths    = [[size[0]/2]]
+    positions = [[size[0]/4]]
+    for level in xrange(1, levels-1):
+        numnodes = len(web[level])
+        lu = [0 for x in range(numnodes)]
+        ld = [0 for x in range(numnodes)]
+        for x in xrange(len(web[level])):
+            lu[x] = len(web[level][x])
+        for x in web[level+1]:
+            for y,certlevel in x:
+                ld[y] += 1
+        w = [ u*d for u,d in zip(lu, ld)]
+        tot = 0
+        for x in w:
+            tot += x
+        # Pad with a total width as wide as the average node.
+        pad = tot/len(w)
+        tot += pad
+        # Adjust units to fit image
+        pad *= size[0] / tot
+        for x in xrange(len(w)):
+            w[x] *= size[0] / tot
+        # Calculate positions. Positions are always the _left_ corner.
+        dist = pad / len(w)
+        pos = dist/2
+        p = []
+        for x in xrange(len(w)):
+            p.append(int(pos))
+            pos += w[x] + dist
+            w[x] = int(w[x])
+        widths.append(w)
+        positions.append(p)
+    widths.append([size[0]/2])
+    positions.append([size[0]/4])
+
+    # Edges
+    for level in xrange(1, levels):
+        for xpos in xrange(len(web[level])):
+            for pointto,certlevel in web[level][xpos]:
+                drawline(draw,
+                         positions[level][xpos] +
+                         widths[level][xpos]/
+                             (len(widths[level-1])+1) * (pointto+1)
+                         ,
+                         yposition(level,   levels, pos_top,    boxh, size[1]),
+                         positions[level-1][pointto] +
+                         widths[level-1][pointto]/
+                             (len(widths[level])+1) * (xpos+1)
+                         ,
+                         yposition(level-1, levels, pos_bottom, boxh, size[1])+1,
+                         conf, certlevel=certlevel)
+    # Nodes
+    for level in xrange(levels):
+        for xpos in xrange(len(web[level])):
+            drawnode(draw,
+                     positions[level][xpos],
+                     yposition(level, levels, pos_top, boxh, size[1]),
+                     widths[level][xpos], boxh,
+                     keys[level][xpos],
+                     wot)
+    im.paste(logo, (size[0]-logo.size[0]-10,
+                    size[1]-logo.size[1]-10,))
+    return im
+
+def webtoordered(web):
+    """Transform unordered web to one suitable for graphing."""
+    webkeys = [web[0].keys()]
+    webarrw = [[[]]]
+    for level in xrange(1, len(web)):
+        if len(web[level]) > 1:
+            # A very simple edge crossing minimization heuristic: Give
+            # number centered around 0 for each node. Close to center
+            # of keys it links to, and close to the middle if many
+            # edges on the other side.
+            # TODO: Prefer graphs that minimizes crossings between
+            # better signatures?
+            nodes = web[level].keys()
+            nextlevellinks = []
+            for x in web[level+1].values():
+                nextlevellinks.extend(x.keys())
+            center = (len(webkeys[level-1])-1) / 2.
+            positions = []
+            for node in nodes:
+                pos = 0.
+                for edgeto in web[level][node]:
+                    pos += webkeys[level-1].index(edgeto)-center
+                pos /= nextlevellinks.count(node)
+                positions.append(pos)
+            sorted = positions[:]
+            sorted.sort()
+            keys = range(len(web[level]))
+            pos = 0
+            for x in sorted:
+                index = positions.index(x)
+                keys[pos] = nodes[index]
+                positions[index] = None
+                pos += 1
+            webkeys.append(keys)
+            webarrw.append([   [ (webkeys[level-1].index(x), web[level][y][x])
+                                 for x in web[level][y]]
+                               for y in webkeys[level]])
+        else:
+            webkeys.append(web[level].keys())
+            webarrw.append([   [ (webkeys[level-1].index(x), web[level][y][x])
+                                 for x in web[level][y]]
+                               for y in webkeys[level]])
+    return webkeys, webarrw
+
+
+# This could be done a lot better. We could draw a text graph similar
+# to the image created above.
+def textweb(wot, web):
+    """Graph a web using text only."""
+    ret = ""
+    for x in web:
+        for y in x:
+            if x[y]:
+                for key in x[y]:
+                    ret += "   [%s]    %s\n" % (clascii[x[y][key]], fullkey(wot, key))
+                ret += "%s  has signed those above \n" % fullkey(wot, y)
+            else:
+                ret += "%s\n" % fullkey(wot, y)
+        ret += '\n'
+    return ret
+
+keyre = re.compile("^(0x)?[0-9a-fA-F]{8}$")
+# We could do this much faster with a dictionary, but looping through
+# all keys is fast enough, and saves some memory.
+def nametokey(wot, name, getall=0):
+    """Search key from name"""
+    if getall and not name:
+        return xrange(len(wot.keys))
+    name = name.strip()
+    if keyre.search(name):
+        key = str2key(name)
+        try:
+            k = wot.keys.index(key)
+        except ValueError:
+            if getall:   return []
+            else:        return None
+        if getall:   return [k]
+        else:        return  k
+    elif name == "random":
+        k = random.randint(0, len(wot.keys)-1)
+        if getall:   return [k]
+        else:        return  k
+    else:
+        if getall: ret = []
+        words = name.lower().split()
+        if len(words)==0:
+            if getall: return xrange(len(wot.keys))
+            else:      return 0
+        for i in xrange(len(wot.names)):
+            for word in words:
+                if wot.names[i].lower().find(word) == -1:
+                    break
+            else:
+                if getall: ret.append(i)
+                else: return i
+    if getall:
+        return ret
+
+def print_key(wot, key, firstindent, indent):
+    yield firstindent + fullkey(wot, key)
+    sigs = wot.sigs[DN][key]
+    sigslist = list(sigs)
+    sigslist.sort()
+    for signedby in sigslist:
+        yield indent + fullkey(wot, signedby, sigs[signedby])
+
+def print_wot(wot):
+    """Print all keys and signatures in wot. Unsorted."""
+    for key in xrange(len(wot.keys)):
+        for line in print_key(wot, key, u"", u"  "):
+            yield line
+
+# XXX If onlykeys, show differences in both directions?
+def diff_wots(wot0, wot1, onlykeys=None):  
+    """Print differences between two web-of-trusts."""
+    import difflib
+
+    yield u"Metadata:"
+    for line in difflib.ndiff([wot0.filename+"\n", "Fileversion: %s\n" % wot0.fileversion],
+                              [wot1.filename+"\n", "Fileversion: %s\n" % wot1.fileversion]):
+        yield line[:-1]
+
+    # Diff the debug files
+    yield u"Debug:"
+    wot0debug = wot0.debug or "\ [No debug information found]\n"
+    wot1debug = wot1.debug or "\ [No debug information found]\n"
+    for line in difflib.ndiff(wot0debug.splitlines(1),
+                              wot1debug.splitlines(1)):
+        yield line[:-1]
+
+    # Diff the READMEs
+    yield u"README:"
+    for line in difflib.ndiff(wot0.readme.splitlines(1),
+                              wot1.readme.splitlines(1)):
+        yield line[:-1]
+
+    # Build reverse lookup dictionaries
+    keys0 = {}
+    keys1 = {}
+    for wot, keys in (wot0, keys0), (wot1, keys1):
+        for keynr in xrange(len(wot.keys)):
+            keys[wot.keys[keynr]] = keynr
+    if onlykeys is not None: # Don't diff the whole WOT.
+        keys0_view = {}
+        keys1_view = {}
+        for key in onlykeys:
+            if key in keys0:  keys0_view[key] = keys0[key]
+            if key in keys1:  keys1_view[key] = keys1[key]
+    else:
+        keys0_view, keys1_view = keys0.copy(), keys1.copy()
+        
+    common_keys = keys0_view.copy() # Not common yet. Some are deleted below.
+    yield u"Removed keys:"
+    for key in keys0_view.copy():
+        if key not in keys1:
+            for line in print_key(wot0, keys0[key], u" - ", u"    "):
+                yield line
+            del common_keys[key]
+    yield u"New keys:"
+    for key in keys1_view.copy():
+        if key not in keys0:
+            for line in print_key(wot1, keys1[key], u" + ", u"    "):
+                yield line
+                
+    yield u"Changed names:"
+    for key in common_keys:
+        if wot0.names[keys0[key]] != wot1.names[keys1[key]]:
+            yield u" ! %s -> %s" % (fullkey(wot0, keys0[key]),
+                                    wot1.names[keys1[key]])
+
+    if onlykeys is not None:
+        yield u"MSDs:"
+        for key in common_keys:
+            msd0, msd1 = msd(wot0, keys0[key]), msd(wot1, keys1[key]) # XXX Modstring
+            msd0str, msd1str = "%2.4f"%msd0[0], "%2.4f"%msd1[0]
+            if msd0str != msd1str:
+                c = "!"
+            else:
+                c = " "
+            # Always print MSD. if msd0str != msd1str:
+            yield u" %s %s -> %s %s" % (c, msd0str, msd1str,
+                                        fullkey(wot1, keys1[key]))
+                
+    yield u"Changed signatures:"
+    for key in common_keys:
+        sigs0, sigs1 = {}, {}
+        tmp = wot0.sigs[DN][keys0[key]]
+        for x in tmp: sigs0[wot0.keys[x]] = tmp[x]
+        tmp = wot1.sigs[DN][keys1[key]]
+        for x in tmp: sigs1[wot1.keys[x]] = tmp[x]
+        del tmp
+
+        changed = 0
+            
+        for sig in sigs0.copy():
+            if sig not in sigs1:
+                if not changed: yield u"  " + fullkey(wot1, keys1[key]);changed=1
+                yield u"   - " + fullkey(wot0, keys0[sig], sigs0[sig])
+                del sigs0[sig]
+        for sig in sigs1.copy():
+            if sig not in sigs0:
+                if not changed: yield u"  " + fullkey(wot1, keys1[key]);changed=1
+                yield u"   + " + fullkey(wot1, keys1[sig], sigs1[sig])
+                del sigs1[sig]
+        for sig in sigs0:
+            if sigs0[sig] != sigs1[sig]:
+                if not changed: yield u"  " + fullkey(wot1, keys1[key]);changed=1
+                yield u"   ! %s -> %s %s" % (clascii[sigs0[sig]], clascii[sigs1[sig]], \
+                                             fullkey(wot0, keys0[sig]))
+                
+        
+def wotstats(wot):
+    """Statistics about the whole WOT"""
+    ret  = "Statistics for this Web of Trust:\n"
+    ret += "Total number of keys:       %6d\n" % len(wot.keys)
+    ret += "Total number of signatures: %6d\n" % wot.numofsigs
+    ret += "Average signatures per key:      %2.4f\n" % \
+           (wot.numofsigs / len(wot.keys))
+    ret += "\n"
+    if wot.readme:
+        ret += "The Web of Trust dump contained this README file:\n"
+        ret += "\n"
+        ret += wot.readme
+    else:
+        ret += "The Web of Trust dump contained no README file.\n"
+    return ret
+
+# TODO: Make HTML version with coloured stripes, to you can find the
+# right connections.
+def groupmatrix(wot, keys, modstring=None):
+    dlen     = len(str(len(keys)-1))
+    _tmp     = u"%"+str(dlen)+u"d"
+    s        = [ _tmp % x for x in xrange(len(keys))]
+    fullkeys = [fullkey(wot, key, alt=alt) for key,alt in keys]
+
+    if modstring:
+        yield u'Warning: modstring not implemented.'
+
+    # Print top/bottom enumeration
+    def vertenum(chars, nrkeys):
+        for n in xrange(chars):
+            line = u"  " + u" " * dlen
+            for m in xrange(nrkeys):
+                line += s[m][n]
+            yield line
+
+    yield u"The numbers on the same row as a key are signatures on that key made"
+    yield u"by the key belonging to that column."
+    yield u""
+
+    notfoundkeys    = keys.count(None)
+    totalsigs       = 0
+    nesigs          = 0
+    sigsnekeys      = 0
+    numberofsigs    = [0 for x in clascii]
+    
+    for line in vertenum(dlen, len(keys)): yield line
+    yield u" " + u" "*dlen + u"." + u"-"*len(keys) + u"."
+    # Print matrix
+    for ny in xrange(len(keys)):
+        y = keys[ny][0]     # Python2.2 doesn't have enumerate.
+        line = u""
+        for nx in xrange(len(keys)):
+            x = keys[nx][0] # Python2.2 doesn't have enumerate.
+            if x is not None and y is not None:
+                if x == y:
+                    line += "\\"
+                elif x in wot.sigs[DN][y]:
+                    totalsigs += 1
+                    numberofsigs[wot.sigs[DN][y][x]] += 1
+                    line += clascii[wot.sigs[DN][y][x]]
+                else:
+                    totalsigs += 1
+                    nesigs    += 1
+                    line += " "
+            else:
+                if nx == ny:
+                    line += "\\"
+                else:
+                    totalsigs  += 1
+                    sigsnekeys += 1
+                    line += " "
+        yield u" %s|%s|%s - %s" % (s[ny], line, s[ny], fullkeys[ny])
+    yield u" " + u" "*dlen + u"`" + u"-"*len(keys) + u"´"
+    for line in vertenum(dlen, len(keys)): yield line
+
+    _tmp = u"%"+str(len(str(totalsigs)))+u"d"
+    yield ""
+    yield     ("Number of keys not found:           "+_tmp) % notfoundkeys
+    yield     ("Number of possible signatures:      "+_tmp) % totalsigs
+    yield     ("of which involves not found keys:   "+_tmp) % sigsnekeys
+    # Python2.2 doesn't have sum.
+    if 'sum' in dir(__builtins__): _tmp2 = sum(numberofsigs)
+    else:
+        _tmp2=0
+        for x in numberofsigs: _tmp2+=x
+    yield     ("Number of signatures:               "+_tmp) % _tmp2
+    for x in xrange(len(clascii)):
+        c = clascii[x] # Python2.2 doesn't have enumerate
+        if x == CL_unilink or x == CL_added:
+            continue
+        yield ("Number of signatures with level %s:  "+_tmp) % (c, numberofsigs[x])
+    yield     ("Number of non-existant signatures:  "+_tmp) % nesigs
+    # Printing names vertically. This is ugly, but might come in
+    # handy?
+    #maxlen = max([len(x) for x in fullkeys])
+    #for y in xrange(maxlen):
+    #    line = u" "*dlen + u" "
+    #    for x in xrange(len(keys)):
+    #        name = fullkeys[x]
+    #        if len(name) > y:
+    #            line += name[y]
+    #        else:
+    #            line += u" "
+    #    yield line
+
+    
+class Mod:
+    """Modstrings - to specify temporary changes in a Wot."""
+    keyre = re.compile("^0x[0-9a-fA-F]{8}$")
+    sigre = re.compile("^0x[0-9a-fA-F]{8}-0x[0-9a-fA-F]{8}$")
+    lvlre = re.compile("^level-[%s]$" % clascii.replace("-","\-")
+                            .replace("]","\]").replace("^","\^"))
+    
+    def __init__(self, wot, modstr):
+        self.wot = wot
+        self.exclunlk = 0
+        self.exclsigs, self.exclkeys, \
+                       self.excllvls, self.add_sigs, self.add_keys = {},{},{},{},{}
+        def e(str):
+            raise wotModstringError, u'Error in modstring "%s": %s' % (modstr, str)
+        for statement in modstr.split(","):
+            if statement[3:4] != ":":
+                e(u'"%s".' % statement)
+            op   = statement[0:3]
+            if   op == "add":  op = 1
+            elif op == "del":  op = 0
+            else: e(u'"%s".' % op)
+            arg = statement[4:]
+            if   self.keyre.search(arg):
+                if not op: self.exclkeys[nametokey(wot, arg)] = None
+                else: e(u'Adding of keys not implemented.')
+            elif self.sigre.search(arg):
+                if op: self.add_sigs[nametokey(wot, arg[ 0:10]),
+                                     nametokey(wot, arg[11:21])]=None
+                else:  self.exclsigs[nametokey(wot, arg[ 0:10]),
+                                     nametokey(wot, arg[11:21])]=None
+            elif self.lvlre.search(arg):
+                if op: e(u'Adding signature level means nothing.')
+                level = clascii.index(arg[6])
+                if level == CL_unilink:
+                    self.exclunlk = 1
+                else:
+                    self.excllvls[level] = None
+            else:
+                e(u'"%s"'%arg)
+    
+    def __str__(self):
+        ret = u""
+        for x in self.exclsigs:
+            ret += u"Excluded signature %s -> %s\n" % (fullkey(self.wot, x[0]),
+                                                       fullkey(self.wot, x[1]))
+        for x in self.add_sigs:
+            ret += u"Included signature %s -> %s\n" % (fullkey(self.wot, x[0]),
+                                                       fullkey(self.wot, x[1]))
+        for x in self.exclkeys:
+            ret += u"Excluded key %s\n" % (fullkey(self.wot, x))
+        for x in self.add_keys:
+            ret += u"Included key %s\n" % (fullkey(self.wot, x))
+        for x in self.excllvls:
+            ret += u"Excluded all signatures with level %s\n" % clascii[x]
+        if self.exclunlk:
+            ret += u"Excluded add non-cross signatures.\n"
+        return ret
+
+class Wot:
+    """Don't think the module and class interfaces are stable. They
+    are not. There are lots of things that needs cleanup first."""
+
+    def __init__(self, dumpfile, fontfile=None):
+        if fontfile:
+            init_pil_get_logo()
+            self.initfont(fontfile)
+        self.sigs = range(2)
+        self.loadfile(dumpfile)
+        self.sigs[UP] = reversesigs(self.sigs[DN])
+        self.numofsigs = 0
+        for x in self.sigs[UP]:
+            self.numofsigs += len(x)
+
+    def __len__(self):
+        return len(self.keys)
+
+    def loadfile(self, dumpfile):
+        (self.names, self.keys, self.sigs[DN], self.readme,
+         self.filename, self.fileversion, self.debug) = loadfile(dumpfile)
+
+    # XXX Don't make the same mistake as PIL makes, and only take filename.
+    def initfont(self, fontfile=None):
+        init_pil_get_logo()
+
+        if fontfile:
+            self.font = ImageFont.load(fontfile)
+            return
+
+        import StringIO, base64, zlib
+        self.font = ImageFont.ImageFont()
+
+        pilstr = base64.decodestring(_fontstr[0])
+        pbmstr = base64.decodestring(_fontstr[1])
+
+        #self.font = ImageFont.load_default()
+        # XXX Suggest to PIL hackers to provide this without leading _.
+        # This only works on PIL 1.1.4 (and higher?)
+        if "_load_pilfont_data" in dir(self.font):
+            self.font._load_pilfont_data(StringIO.StringIO(pilstr),
+                                         Image.open(StringIO.StringIO(pbmstr)))
+        else:
+            # OK, this is not race free, but there is no way to be
+            # race free on Python 2.2. This isn't needed at all with
+            # PIL 1.1.4.
+            import tempfile
+            tmpdir = tempfile.mktemp("-wotsappilhack.tmp")  # Not race free.
+            os.mkdir(tmpdir)
+            f0 = tmpdir + "/font.pil"
+            f1 = tmpdir + "/font.pbm"
+            print >>sys.stderr, \
+                  "Warning: Old PIL version, using temp files %s and %s." %\
+                  ( f0, f1)
+            try:
+                open(f0, "w").write(pilstr)
+                open(f1, "w").write(pbmstr)
+                self.font = ImageFont.load("/tmp/pilfonthack.pil")
+            finally:
+                for f in f0, f1:
+                    try: os.remove(f)
+                    except OSError: pass
+                try: os.rmdir(tmpdir)
+                except OSError, (errno, strerror):
+                    print >>sys.stderr, \
+                          'Unable to remove temporary directory "%s": %s' % (tmpdir, strerror)
+
+    def nametokey(self, name):
+        key = nametokey(self, name)
+        if key is not None:
+            return "0x" + key2str(self.keys[key])
+        raise wotKeyNotFoundError(name)
+
+    def creategraph(self, web, config=None, format='txt'):
+        if   format=='txt':
+            return textweb(self, web)
+        elif format == 'PIL':
+            (webkeys, webarrw) = webtoordered(web)
+            return create_pil(webarrw, webkeys, config, self)
+        else:
+            raise ValueError
+
+    def findpaths(self, nbottom, ntop, modstr=None):
+        bottom = nametokey(self, nbottom)
+        if bottom is None:
+            raise wotKeyNotFoundError(nbottom)
+        top    = nametokey(self, ntop   )
+        if top is None:
+            raise wotKeyNotFoundError(ntop)
+        if modstr: mod = Mod(self, modstr)
+        else: mod = None
+        return findpaths(self, bottom, top, mod=mod)
+
+    def keystats(self, name, modstring=None, wanted=0, restrict=None, timer=None):
+        key = nametokey(self, name)
+        if key is None:
+            raise wotKeyNotFoundError(name)
+        if modstring: mod = Mod(self, modstring)
+        else: mod = None
+        return keystats(self, key, mod=mod, wanted=wanted,
+                        restrict=restrict, timer=timer)
+
+    def wotstats(self):
+        return wotstats(self)
+
+    def groupmatrix(self, keys, searchstring=None, modstring=None, maxkeys=200):
+        if keys:
+            keys = [(nametokey(self, key), key) for key in keys.split(",")]
+        else:
+            keys = []
+        if searchstring:
+            skeys = nametokey(self, searchstring, getall=1)
+            if len(skeys) > maxkeys:
+                raise wotTooManyError(len(skeys))
+            keys += [(key, "%s not found"%searchstring) for key in skeys]
+        for line in groupmatrix(self, keys, modstring):
+            yield line
+
+    def listkeys(self, keys):
+        keylist = nametokey(self, keys, getall=1)
+        yield u'Listing the %d keys matching "%s" out of totally %d keys:' % \
+              (len(keylist), keys, len(self.keys))
+        for key in keylist:
+            yield fullkey(self, key)
+        yield 'Comma separated list of KeyIDs:'
+        yield ",".join(["0x"+key2str(self.keys[key]) for key in keylist])
+
+    def msd(self, key, modstring=None, forbiddenkeys=None):
+        return msd(self, key, modstring, forbiddenkeys)
+
+def wotsapmain(argv):
+    import locale, getopt
+
+    # Python 2.3 seems to encode to LC_CTYPE automatically, but 2.2
+    # does not. Leave it for now.
+    if "getpreferredencoding" in dir(locale):
+        encoding = locale.getpreferredencoding()
+    else:
+        locale.setlocale(locale.LC_CTYPE, "")
+        encoding = locale.nl_langinfo(locale.CODESET)
+
+    def usage(i=0):
+        if i:
+            out = sys.stderr
+        else:
+            out = sys.stdout
+        print >>out, (
+            u"Usage: %s [OPTION]... [bottomkey [topkey]]\n" \
+            u"\n" \
+            u"Options:\n" \
+            u"  -h, --help         Show help\n" \
+            u"      --version      Show version\n" \
+            u"  -w, --wot=FILE     Read web-of-trust information from FILE.\n" \
+            u"                     Defaults to ~/.wotsapdb\n" \
+            u"  -m, --modify=STR   Use STR as wot modification string.\n" \
+            u"  -g, --group        Print signature matrix of comma separated keys.\n" \
+            u"  -o, --png=FILE     Write .png output to FILE.\n" \
+            u"  -O, --show-png=PRG Use PRG to view (temporary) PNG image\n" \
+            u"  -F, --font=FILE    (Only needed in png output) Font file in .pil/.pbm format.\n" \
+            u"                     Point it to the .pil file, with the .pbm file in the same\n" \
+            u"                     directory. Defaults to ~/.wotsapfont.pil\n" \
+            u"  -p, --print        Print the whole web-of-trust in human readable format.\n" \
+            u"  -D, --print-debug  Print the debug information in the .wot file.\n" \
+            u"  -d, --diff=FILE    Print all differences between two .wot files.\n" \
+            u"  -M, --msd          Just show MSD for key.\n" \
+            u"  -W, --wanted[=NUM] Show the NUM(10) 'most wanted signatures' for key.\n" \
+            u"  -r, --restrict=STR Restrict wanted signatures with STR, implies -W.\n" \
+            % argv[0] ).encode(encoding, 'replace')
+        sys.exit(i)
+    def showversion():
+        print (
+            u"wotsap (Web of trust statistics and pathfinder) version %s\n" \
+            u"\n" \
+            u"Copyright (C) 2003,2004 Jörgen Cederlöf\n" \
+            u"\n"
+            u"This is free software; see the source for copying conditions.  There is NO\n" \
+            u"warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE." \
+            % VERSION ).encode(encoding, 'replace')
+        sys.exit(0)
+        
+
+    try:
+        if 'gnu_getopt' in dir(getopt):
+            gopt = getopt.gnu_getopt
+        else:
+            gopt = getopt.getopt
+        opts, args = gopt(argv[1:],
+                          "hw:m:go:O:F:pDd:MW:r:",
+                          ["help", "wot=", "modify=", "group", "png=", "show-png=",
+                           "font=", "print", "print-debug", "diff=", "version",
+                           "msd", "wanted=", "restrict="])
+    except getopt.GetoptError:
+        usage(2)
+
+    wotfile    = os.path.expanduser("~/.wotsapdb")
+    fontfile   = None
+    group      = None
+    pngfile    = None
+    modifystr  = None
+    pngprg     = None
+    printmsd   = 0
+    wanted     = 0
+    restrict   = None
+    prnt       = 0
+    prnt_debug = 0
+    diff       = None
+    for o, a in opts:
+        if   o in ("-h", "--help"):
+            usage(0)
+        elif o in ("--version",):
+            showversion()
+        elif o in ("-w", "--wot"):
+            wotfile = a
+        elif o in ("-m", "--modify"):
+            modifystr = a
+        elif o in ("-g", "--group"):
+            group = 1
+        elif o in ("-o", "--png"):
+            pngfile = a
+        elif o in ("-O", "--show-png"):
+            pngprg = a
+        elif o in ("-F", "--font"):
+            fontfile = a
+        elif o in ("-p", "--print"):
+            prnt=1
+        elif o in ("-D", "--print-debug"):
+            prnt_debug=1
+        elif o in ("-d", "--diff"):
+            diff = a
+        elif o in ("-M", "--msd"):
+            printmsd = 1
+        elif o in ("-W", "--wanted"):
+            if a:
+                wanted = int(a)
+            else:
+                wanted = 10
+        elif o in ("-r", "--restrict"):
+            restrict = a
+            if not wanted:
+                wanted = 10
+    top=bottom=None
+    if   len(args)==1:
+        top    = unicode(args[0], encoding, 'replace')
+    elif len(args)==2:
+        top    = unicode(args[1], encoding, 'replace')
+        bottom = unicode(args[0], encoding, 'replace')
+    elif len(args)>=3:
+        usage(1)
+
+    try:
+        wot = Wot(wotfile)
+    except wotLoadFileError, err:
+        print unicode(err).encode(encoding, 'replace')
+        print "You need a .wot file which contains the list of keys and signatures."
+        print "You can download http://www.lysator.liu.se/~jc/wotsap/wots/latest.wot"
+        print "and either name it ~/.wotsapdb or give the filename as the -w argument."
+        sys.exit(1)
+
+    if group:
+        if bottom:
+            print >>sys.stderr, u"Please supply one argument only."
+            sys.exit(7)
+        for line in wot.groupmatrix(top):
+            print line.encode(encoding, 'replace')
+        sys.exit(0)
+
+    if prnt:
+        for line in print_wot(wot):
+            print line.encode(encoding, 'replace')
+        sys.exit(0)
+
+    if prnt_debug:
+        if wot.debug:
+            print wot.debug.encode(encoding, 'replace')
+        else:
+            print u"Sorry, no debug information found in file." \
+                  .encode(encoding, 'replace')
+        sys.exit(0)
+
+    if printmsd:
+        if not top:
+            usage(2)
+        keyn = nametokey(wot, top)
+        if keyn is None:
+            print >>sys.stderr, (u"Sorry, key \"%s\" not found." % top) \
+                  .encode(encoding, 'replace')
+        # DEBUG: Useful for checking speed in msd() and findnext().
+        if 0:
+            import time
+            a = time.time()
+            for x in xrange(10):  __msd_standalone(wot, x)
+            b = time.time()
+            for x in xrange(10):  msd(wot, x)
+            c = time.time()
+            ab,bc = b-a,c-b
+            print ab,bc
+            print ab/ab, bc/ab
+        print msd(wot, keyn, modifystr)[0]
+        sys.exit(0)
+
+    if diff:
+        try:
+            wot1 = Wot(diff)
+        except wotLoadFileError, err:
+            print unicode(err).encode(encoding, 'replace')
+            sys.exit(1)
+        if top:
+            key = nametokey(wot, top)
+            if key is not None:
+                key = wot.keys[key]
+            else:
+                key = nametokey(wot1, top)
+                if key is not None:
+                    key = wot1.keys[key]
+            if key is None:
+                print >>sys.stderr, (u"Sorry, key \"%s\" not found." % top) \
+                      .encode(encoding, 'replace')
+                sys.exit(7)
+            key = [key]
+        else:
+            key = None
+        for line in diff_wots(wot, wot1, key):
+            print line.encode(encoding, 'replace')
+        sys.exit(0)
+
+    if top and bottom:
+        try:
+            web = wot.findpaths(bottom, top, modstr=modifystr)
+        except (wotKeyNotFoundError, wotModstringError), err:
+            print >>sys.stderr, unicode(err).encode(encoding, 'replace')
+            sys.exit(2)
+            
+        if web is None:
+            print >>sys.stderr, "Sorry, unable to find path."
+            sys.exit(1)
+
+        print wot.creategraph(web, format='txt').encode(encoding, 'replace')
+
+        if pngfile or pngprg:
+            wot.initfont(fontfile)
+            ret = wot.creategraph(web, format="PIL")
+            if pngprg and not pngfile:
+                import tempfile
+                # Python 2.2 doesn't have mkstemp.
+                if 'mkstemp' in dir(tempfile):
+                    pngfile = tempfile.mkstemp(".png", "wotsap-")[1]
+                else:
+                    pngfile = tempfile.mktemp(".png") # Not race free
+
+            print >>sys.stderr, "Writing .png file %s: " % pngfile,
+            try:
+                f = open(pngfile, "w")
+            except IOError, (errno, strerror):
+                print >>sys.stderr, \
+                      'Unable to open file: %s' % strerror
+                sys.exit(2)
+            ret.save(f, "png", optimize=1)
+            # XXX Option to use pngcrush or similar to reduce size?
+            print >>sys.stderr, "Done."
+            if pngprg:
+                #ret = os.spawnlp(os.P_WAIT, pngprg, pngprg, pngfile)
+                # sh will print error message if needed.
+                ret = os.system("%s %s" % (pngprg, pngfile))
+                try:
+                    os.remove(pngfile)
+                except OSError, (errno, strerror):
+                    # The file is probably already removed.
+                    print >>sys.stderr, \
+                          'Warning: Unable to remove temporary file %s: %s' \
+                          % (pngfile, strerror)
+
+
+    elif top:
+        try:
+            timer = {'time'     : 3,
+                     'fraction' : 0.50,
+                     'action'   : 'stderr'}
+            stats = wot.keystats(top, modstring=modifystr, wanted=wanted,
+                                 restrict=restrict, timer=timer)
+        except (wotKeyNotFoundError, wotModstringError), err:
+            print >>sys.stderr, unicode(err).encode(encoding, 'replace')
+            sys.exit(2)
+        else:
+            print stats.encode(encoding, 'replace')
+            
+    else:
+        print wot.wotstats().encode(encoding, 'replace')
+
+
+if __name__ == "__main__":
+    wotsapmain(sys.argv)

@@ -1,0 +1,22 @@
+2004-12-12  Jörgen Cederlöf  <jc@lysator.liu.se>
+        Loads of changes, too many to list in detail, most of them
+        actually implemented some time ago. Everything is optimized for
+        Python 2.3 and should work on Python 2.4 but still has
+        compatibility for Python 2.2.
+
+        * pks2wot.py:
+                     - All keys and signatures verified with GnuPG
+                     - Always use primary user ID
+                     - Indicate if primary user ID is signed
+                     - Save signature type
+                     - New .wot file format including signature types
+                     - Safe caching and other speedups
+        * wotsap.py:
+                     - Handle new .wot file format
+                     - Most Wanted patch by Marco Bodrato
+                     - Group matrix
+                     - Modstrings
+                     - Handles signature types
+                     - Better command line options handling
+                     - Can show all differences between two .wot files
+                     - No external font files are needed

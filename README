@@ -1,8 +1,9 @@
 
- Web of Trust statistics and pathfinder, Wotsap
+ Web of trust statistics and pathfinder, Wotsap
 
 This package contains the code used at
-http://www.lysator.liu.se/~jc/wotsap/.
+http://www.lysator.liu.se/~jc/wotsap/. Most documentation is available
+on the web pages.
 
 README:
 
@@ -11,29 +12,19 @@ README:
 wotsap.py:
 
   The main Wotsap Python module. It also works as a standalone
-  program, but right now it only produces quite boring text graphs. 
-  The statistics is identical though.
+  program.
 
 Webware-Main.py:
 
   Glue between wotsap.py and Webware
   (http://webware.sourceforge.net/).
 
-Webware-Redirect.py:
-
-  Simple Webware module which does nothing but redirect to a specified
-  URL.
-
 pks2wot.py:
 
   A program to create .wot files using the pksclient program. You need
-  a local keyserver to use it. It should be fairly easy to adopt it to
-  client programs for other keyservers.
+  a local pks keyserver to use it. It should be fairly easy to adopt
+  it to client programs for other keyservers.
 
 wotfileformat.txt:
 
   Specification for the .wot file format.
-
-index.html:
-
-  A sample xhtml page with forms to query Wotsap.
