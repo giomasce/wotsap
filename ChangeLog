@@ -1,4 +1,19 @@
 
+2016-07-17  Giovanni Mascellani <gio@debian.org>
+	Release 0.8~unreleased
+
+	Since the original software is not maintained anymore but there a
+	few patches around, I am taking over the maintainance. I will do
+	very few original development by myself, but will accept
+	contributions from whoever wants.
+
+	* wotsap:
+
+                     - Remove horrible embedded PIL font and use by
+                       default system TTF fonts.
+                     - Small bugfix patch by Claudius Hubig
+	               <debian_1303@chubig.net>.
+
 2013-02-16  Jörgen Cederlöf  <jc@lysator.liu.se>
 	Release 0.7
 
