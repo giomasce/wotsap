@@ -1,9 +1,14 @@
 
  Web of trust statistics and pathfinder, Wotsap
 
-This package contains the code used at
+Wotsap is a tool that analyzes a OpenPGP Web of Trust description and
+reports to the user stastistics about the single keys and the whole
+network, or searches for paths from one key to another.
+
+This package was originally developed by Jörgen Cederlöf at
 http://www.lysator.liu.se/~jc/wotsap/. Most documentation is available
-on the web pages.
+on the web pages. The development there is now frozen and continues on
+https://github.com/giomasce/wotsap. Every contribution is welcome!
 
 README:
 
