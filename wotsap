@@ -237,7 +237,8 @@ def loadfile(wotfilename):
         error(u'Unable to read from file "%s": %s' % (wotfilename, strerror))
 
     if s != header:
-        f = os.popen('bunzip2 < "%s"' % wotfilename, "rb")
+        import bz2
+        f = bz2.BZ2File(wotfilename, "rb")
         s = f.read(len(header))
         if s != header:
             error(u"%s does not look like a .wot file." % wotfilename)
