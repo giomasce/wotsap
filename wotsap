@@ -5,7 +5,7 @@
 # http://www.lysator.liu.se/~jc/wotsap/
 # Copyright (C) 2003,2004  Jörgen Cederlöf <jc@lysator.liu.se>
 # modified 2004 by Marco Bodrato <gpg@bodrato.it> ("wanted sigs")
-# Copyright © 2016 Giovanni Mascellani <gio@debian.org>
+# Copyright © 2016-2018 Giovanni Mascellani <gio@debian.org>
 # 
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -209,7 +209,7 @@ def init_pil_get_logo():
         curcol, othercol = othercol, curcol
 
     init_pil_get_logo_logo = \
-                  Image.fromstring('P', (175,15), string.join(logostr, ""))
+                  Image.frombytes('P', (175,15), string.join(logostr, ""))
     return init_pil_get_logo_logo
 
 
